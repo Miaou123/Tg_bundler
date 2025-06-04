@@ -9,6 +9,8 @@ import {
 	Keypair,
 	LAMPORTS_PER_SOL,
 	AddressLookupTableAccount,
+	AccountMeta,
+	ComputeBudgetProgram,
 } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
 import { searcherClient } from "./clients/jito";
@@ -46,13 +48,6 @@ export async function buyBundle() {
 	}
 
 	const lut = new PublicKey(keyInfo.addressLUT.toString());
-
-	const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
-
-	if (lookupTableAccount == null) {
-		console.log("Lookup table account not found!");
-		process.exit(0);
-	}
 
 	// -------- step 1: ask nessesary questions for pool build --------
 	const name = prompt("Name of your token: ");
@@ -108,7 +103,11 @@ export async function buyBundle() {
 	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
 	console.log(`Mint: ${mintKp.publicKey.toBase58()}`);
 
-	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
+	// Derive accounts using the PUMP_PROGRAM (not the anchor program)
+	const [bondingCurve] = PublicKey.findProgramAddressSync(
+		[Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
+		PUMP_PROGRAM
+	);
 	const [metadata] = PublicKey.findProgramAddressSync(
 		[Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
 		MPL_TOKEN_METADATA_PROGRAM_ID
@@ -124,34 +123,10 @@ export async function buyBundle() {
 	console.log("Associated Bonding Curve:", associatedBondingCurve.toString());
 	console.log("Global:", global.toString());
 
-	const createIx = await program.methods
-		.create(name, symbol, metadata_uri)
-		.accounts({
-			mint: mintKp.publicKey,
-			mintAuthority: mintAuthority,
-			bondingCurve: bondingCurve,
-			associatedBondingCurve: associatedBondingCurve,
-			global: global,
-			mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,
-			metadata: metadata,
-			user: wallet.publicKey,
-			systemProgram: SystemProgram.programId,
-			tokenProgram: spl.TOKEN_PROGRAM_ID,
-			associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
-			rent: SYSVAR_RENT_PUBKEY,
-			eventAuthority: eventAuthority,
-			program: PUMP_PROGRAM,
-		})
-		.instruction();
-
-	// Get the associated token address
-	const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
-	const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, ata, wallet.publicKey, mintKp.publicKey);
-
-	// Extract tokenAmount from keyInfo for this keypair
+	// Extract tokenAmount from keyInfo for dev wallet
 	const keypairInfo = keyInfo[wallet.publicKey.toString()];
 	if (!keypairInfo) {
-		console.log(`No key info found for keypair: ${wallet.publicKey.toString()}`);
+		console.log(`No key info found for dev wallet: ${wallet.publicKey.toString()}`);
 		return;
 	}
 
@@ -159,23 +134,104 @@ export async function buyBundle() {
 	const amount = new BN(keypairInfo.tokenAmount);
 	const solAmount = new BN(keypairInfo.solAmount * LAMPORTS_PER_SOL);
 
-	const buyIx = await program.methods
-		.buy(amount, solAmount)
-		.accounts({
-			global: global,
-			feeRecipient: feeRecipient,
-			mint: mintKp.publicKey,
-			bondingCurve: bondingCurve,
-			associatedBondingCurve: associatedBondingCurve,
-			associatedUser: ata,
-			user: wallet.publicKey,
-			systemProgram: SystemProgram.programId,
-			tokenProgram: spl.TOKEN_PROGRAM_ID,
-			rent: SYSVAR_RENT_PUBKEY,
-			eventAuthority: eventAuthority,
-			program: PUMP_PROGRAM,
-		})
-		.instruction();
+	console.log("Building manual instructions with exact format...");
+
+	// Manual create instruction with exact Pump.Fun format
+	const createData = Buffer.alloc(512);
+	let offset = 0;
+
+	// Method selector (from successful Pump.Fun transactions)
+	const selector = Buffer.from([24, 30, 200, 40, 5, 28, 7, 119]);
+	selector.copy(createData, offset);
+	offset += 8;
+
+	// String encoding: length as u32 LE + utf8 bytes
+	function writeString(str: string) {
+		const strBytes = Buffer.from(str, 'utf8');
+		createData.writeUInt32LE(strBytes.length, offset);
+		offset += 4;
+		strBytes.copy(createData, offset);
+		offset += strBytes.length;
+	}
+
+	writeString(name);
+	writeString(symbol);
+	writeString(metadata_uri);
+
+	const createInstructionData = createData.subarray(0, offset);
+
+	const createIx = new TransactionInstruction({
+		keys: [
+			{ pubkey: mintKp.publicKey, isSigner: true, isWritable: true },
+			{ pubkey: mintAuthority, isSigner: false, isWritable: false },
+			{ pubkey: bondingCurve, isSigner: false, isWritable: true },
+			{ pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+			{ pubkey: global, isSigner: false, isWritable: false },
+			{ pubkey: MPL_TOKEN_METADATA_PROGRAM_ID, isSigner: false, isWritable: false },
+			{ pubkey: metadata, isSigner: false, isWritable: true },
+			{ pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+			{ pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+			{ pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+			{ pubkey: spl.ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+			{ pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+			{ pubkey: eventAuthority, isSigner: false, isWritable: false },
+			{ pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+		],
+		programId: PUMP_PROGRAM,
+		data: createInstructionData,
+	});
+
+	console.log("Create instruction data length:", createInstructionData.length);
+
+	// Get the associated token address for dev wallet
+	const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
+
+	// Manual buy instruction
+	const buyData = Buffer.alloc(24);
+	offset = 0;
+
+	// Buy method selector
+	const buySelector = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+	buySelector.copy(buyData, offset);
+	offset += 8;
+
+	// Amount (u64 LE)
+	amount.toArrayLike(Buffer, 'le', 8).copy(buyData, offset);
+	offset += 8;
+
+	// Max SOL cost (u64 LE)
+	solAmount.toArrayLike(Buffer, 'le', 8).copy(buyData, offset);
+
+	const buyIx = new TransactionInstruction({
+		keys: [
+			{ pubkey: global, isSigner: false, isWritable: false },
+			{ pubkey: feeRecipient, isSigner: false, isWritable: true },
+			{ pubkey: mintKp.publicKey, isSigner: false, isWritable: false },
+			{ pubkey: bondingCurve, isSigner: false, isWritable: true },
+			{ pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+			{ pubkey: ata, isSigner: false, isWritable: true },
+			{ pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+			{ pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+			{ pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+			{ pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+			{ pubkey: eventAuthority, isSigner: false, isWritable: false },
+			{ pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+		],
+		programId: PUMP_PROGRAM,
+		data: buyData,
+	});
+
+	// Add compute budget instructions
+	const computeLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 });
+	const computePriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000 });
+
+	// Create ATA instruction - use the right one that works
+	const ataIx = spl.createAssociatedTokenAccountInstruction(
+		wallet.publicKey, // payer
+		ata, // ata address
+		wallet.publicKey, // owner
+		mintKp.publicKey // mint
+	);
 
 	const tipIxn = SystemProgram.transfer({
 		fromPubkey: wallet.publicKey,
@@ -183,50 +239,61 @@ export async function buyBundle() {
 		lamports: BigInt(tipAmt),
 	});
 
-	const initIxs: TransactionInstruction[] = [createIx, ataIx, buyIx, tipIxn];
+	// Build instruction array
+	const initIxs: TransactionInstruction[] = [
+		computeLimitIx, 
+		computePriceIx, 
+		createIx, 
+		ataIx, 
+		buyIx, 
+		tipIxn
+	];
 
 	const { blockhash } = await connection.getLatestBlockhash();
+
+	// Get lookup table account properly
+	const lutAccount = (await connection.getAddressLookupTable(lut)).value;
+	if (!lutAccount) {
+		console.log("Lookup table account not found!");
+		return;
+	}
 
 	const messageV0 = new TransactionMessage({
 		payerKey: wallet.publicKey,
 		instructions: initIxs,
 		recentBlockhash: blockhash,
-	}).compileToV0Message();
+	}).compileToV0Message([lutAccount]);
 
 	const fullTX = new VersionedTransaction(messageV0);
-
-	console.log("=== TRANSACTION DEBUG ===");
-	console.log("Number of instructions:", initIxs.length);
-	initIxs.forEach((ix, index) => {
-		console.log(`Instruction ${index + 1}:`, ix.programId.toString());
-		console.log(`  Keys: ${ix.keys.length} accounts`);
-		console.log(`  Data length: ${ix.data.length} bytes`);
-	});
-
 	fullTX.sign([wallet, mintKp]);
+
+	// Check transaction size
+	const serializedTx = fullTX.serialize();
+	console.log(`Initial transaction size: ${serializedTx.length} bytes`);
 
 	bundledTxns.push(fullTX);
 
 	// -------- step 3: create swap txns --------
-	const txMainSwaps: VersionedTransaction[] = await createWalletSwaps(blockhash, keypairs, lookupTableAccount, bondingCurve, mintKp.publicKey, program);
+	const txMainSwaps: VersionedTransaction[] = await createWalletSwaps(blockhash, keypairs, lutAccount, bondingCurve, associatedBondingCurve, mintKp.publicKey);
 	bundledTxns.push(...txMainSwaps);
 
 	// -------- step 4: send bundle --------
-	for (const tx of bundledTxns) {
+	// Simulate each transaction
+	console.log("\n=== SIMULATING ALL TRANSACTIONS ===");
+	for (let i = 0; i < bundledTxns.length; i++) {
+		const tx = bundledTxns[i];
+		console.log(`\nSimulating transaction ${i + 1}/${bundledTxns.length}:`);
 		try {
 			const simulationResult = await connection.simulateTransaction(tx, { commitment: "processed" });
-			console.log("=== SIMULATION RESULT ===");
-			console.log(simulationResult);
-	
+
 			if (simulationResult.value.err) {
-				console.error("Simulation error for transaction:", simulationResult.value.err);
+				console.error("❌ Simulation error:", simulationResult.value.err);
 				console.log("Logs:", simulationResult.value.logs);
 			} else {
-				console.log("Simulation success for transaction. Logs:");
-				simulationResult.value.logs?.forEach(log => console.log(log));
+				console.log("✅ Simulation success!");
 			}
 		} catch (error) {
-			console.error("Error during simulation:", error);
+			console.error("❌ Error during simulation:", error);
 		}
 	}
 
@@ -238,11 +305,11 @@ async function createWalletSwaps(
 	keypairs: Keypair[],
 	lut: AddressLookupTableAccount,
 	bondingCurve: PublicKey,
-	mint: PublicKey,
-	program: Program
+	associatedBondingCurve: PublicKey,
+	mint: PublicKey
 ): Promise<VersionedTransaction[]> {
 	const txsSigned: VersionedTransaction[] = [];
-	const chunkedKeypairs = chunkArray(keypairs, 6);
+	const chunkedKeypairs = chunkArray(keypairs, 2);
 
 	// Load keyInfo data from JSON file
 	let keyInfo: { [key: string]: { solAmount: number; tokenAmount: string; percentSupply: number } } = {};
@@ -254,52 +321,74 @@ async function createWalletSwaps(
 	// Iterate over each chunk of keypairs
 	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
 		const chunk = chunkedKeypairs[chunkIndex];
+		const validKeypairs = chunk.filter(kp => kp.publicKey.toString() in keyInfo);
+		
+		if (validKeypairs.length === 0) {
+			console.log(`Skipping chunk ${chunkIndex} - no valid keypairs`);
+			continue;
+		}
+
 		const instructionsForChunk: TransactionInstruction[] = [];
 
-		// Iterate over each keypair in the chunk to create swap instructions
-		for (let i = 0; i < chunk.length; i++) {
-			const keypair = chunk[i];
-			console.log(`Processing keypair ${i + 1}/${chunk.length}:`, keypair.publicKey.toString());
+		// Add compute budget
+		const computeLimitIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 });
+		const computePriceIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1000 });
+		instructionsForChunk.push(computeLimitIx, computePriceIx);
 
-			const ataAddress = await spl.getAssociatedTokenAddress(mint, keypair.publicKey);
-			const createTokenAta = spl.createAssociatedTokenAccountIdempotentInstruction(keypair.publicKey, ataAddress, keypair.publicKey, mint);
+		// Process each valid keypair
+		for (const keypair of validKeypairs) {
+			console.log(`Processing keypair: ${keypair.publicKey.toString()}`);
 
-			// Extract tokenAmount from keyInfo for this keypair
+			const ataAddress = spl.getAssociatedTokenAddressSync(mint, keypair.publicKey);
 			const keypairInfo = keyInfo[keypair.publicKey.toString()];
-			if (!keypairInfo) {
-				console.log(`No key info found for keypair: ${keypair.publicKey.toString()}`);
-				continue;
-			}
-
-			// Calculate SOL amount based on tokenAmount
 			const amount = new BN(keypairInfo.tokenAmount);
 			const solAmount = new BN(keypairInfo.solAmount * LAMPORTS_PER_SOL);
 
-			const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-				[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
-				spl.ASSOCIATED_TOKEN_PROGRAM_ID
+			// Create ATA instruction
+			const createTokenAta = spl.createAssociatedTokenAccountInstruction(
+				payer.publicKey,
+				ataAddress,
+				keypair.publicKey,
+				mint
 			);
 
-			const buyIx = await program.methods
-				.buy(amount, solAmount)
-				.accounts({
-					global: global,
-					feeRecipient: feeRecipient,
-					mint: mint,
-					bondingCurve: bondingCurve,
-					associatedBondingCurve: associatedBondingCurve,
-					associatedUser: ataAddress,
-					user: keypair.publicKey,
-					systemProgram: SystemProgram.programId,
-					tokenProgram: spl.TOKEN_PROGRAM_ID,
-					rent: SYSVAR_RENT_PUBKEY,
-					eventAuthority: eventAuthority,
-					program: PUMP_PROGRAM,
-				})
-				.instruction();
+			// Manual buy instruction
+			const buyData = Buffer.alloc(24);
+			let offset = 0;
+
+			// Buy selector
+			const buySelector = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
+			buySelector.copy(buyData, offset);
+			offset += 8;
+
+			// Amount and sol amount
+			amount.toArrayLike(Buffer, 'le', 8).copy(buyData, offset);
+			offset += 8;
+			solAmount.toArrayLike(Buffer, 'le', 8).copy(buyData, offset);
+
+			const buyIx = new TransactionInstruction({
+				keys: [
+					{ pubkey: global, isSigner: false, isWritable: false },
+					{ pubkey: feeRecipient, isSigner: false, isWritable: true },
+					{ pubkey: mint, isSigner: false, isWritable: false },
+					{ pubkey: bondingCurve, isSigner: false, isWritable: true },
+					{ pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+					{ pubkey: ataAddress, isSigner: false, isWritable: true },
+					{ pubkey: keypair.publicKey, isSigner: true, isWritable: true },
+					{ pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+					{ pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+					{ pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+					{ pubkey: eventAuthority, isSigner: false, isWritable: false },
+					{ pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+				],
+				programId: PUMP_PROGRAM,
+				data: buyData,
+			});
 
 			instructionsForChunk.push(createTokenAta, buyIx);
 		}
+
+		if (instructionsForChunk.length <= 2) continue;
 
 		const message = new TransactionMessage({
 			payerKey: payer.publicKey,
@@ -312,22 +401,15 @@ async function createWalletSwaps(
 		const serializedMsg = versionedTx.serialize();
 		console.log("Txn size:", serializedMsg.length);
 		if (serializedMsg.length > 1232) {
-			console.log("tx too big");
+			console.log("tx too big, skipping");
+			continue;
 		}
 
-		console.log(
-			"Signing transaction with chunk signers",
-			chunk.map((kp) => kp.publicKey.toString())
-		);
-
-		// Sign with the keypairs first
-		for (const kp of chunk) {
-			if (kp.publicKey.toString() in keyInfo) {
-				versionedTx.sign([kp]);
-			}
-		}
-
+		// Sign transaction
 		versionedTx.sign([payer]);
+		for (const kp of validKeypairs) {
+			versionedTx.sign([kp]);
+		}
 
 		txsSigned.push(versionedTx);
 	}
@@ -340,53 +422,32 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 }
 
 export async function sendBundle(bundledTxns: VersionedTransaction[]) {
-	/*
-    // Simulate each transaction
-    for (const tx of bundledTxns) {
-        try {
-            const simulationResult = await connection.simulateTransaction(tx, { commitment: "processed" });
-
-            if (simulationResult.value.err) {
-                console.error("Simulation error for transaction:", simulationResult.value.err);
-            } else {
-                console.log("Simulation success for transaction. Logs:");
-                simulationResult.value.logs?.forEach(log => console.log(log));
-            }
-        } catch (error) {
-            console.error("Error during simulation:", error);
-        }
-    }
-    //*/
+	if (bundledTxns.length === 0) {
+		console.log("No transactions to send in bundle");
+		return;
+	}
 
 	try {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
 		console.log(`Bundle ${bundleId} sent.`);
 
-		///*
-		// Assuming onBundleResult returns a Promise<BundleResult>
+		// Listen for bundle result
 		const result = await new Promise((resolve, reject) => {
 			searcherClient.onBundleResult(
 				(result) => {
 					console.log("Received bundle result:", result);
-					resolve(result); // Resolve the promise with the result
+					resolve(result);
 				},
 				(e: Error) => {
 					console.error("Error receiving bundle result:", e);
-					reject(e); // Reject the promise if there's an error
+					reject(e);
 				}
 			);
 		});
 
 		console.log("Result:", result);
-		//*/
 	} catch (error) {
 		const err = error as any;
 		console.error("Error sending bundle:", err.message);
-
-		if (err?.message?.includes("Bundle Dropped, no connected leader up soon")) {
-			console.error("Error sending bundle: Bundle Dropped, no connected leader up soon.");
-		} else {
-			console.error("An unexpected error occurred:", err.message);
-		}
 	}
 }
