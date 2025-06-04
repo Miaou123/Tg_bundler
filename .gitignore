@@ -1,0 +1,83 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Keypairs and sensitive keys
+src/keypairs/
+blockengine.json
+payer.json
+*.json.bak
+
+# Key info files containing wallet data
+src/keyInfo.json
+keyInfo.json
+
+# Config files with private keys
+config.ts
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Images (if they contain sensitive content)
+img/
+images/
+
+# Temporary files
+tmp/
+temp/
+
+# Metadata files that might contain sensitive info
+metadata.json
+
+# Any backup files
+*.backup
+*.bak
+
+# Compiled JavaScript files (if you're only pushing TypeScript)
+*.js
+*.js.map
+
+# But keep essential config files (add exceptions if needed)
+!jest.config.js
+!webpack.config.js

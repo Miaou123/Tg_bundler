@@ -137,7 +137,13 @@ export async function sellXPercentageRAY() {
 			sellTotalAmount += transferAmount; // Keep track to sell at the end
 			console.log(`Sending ${transferAmount / 1e6} from dev wallet.`);
 
-			const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, PayerTokenATA, mintKp.publicKey);
+			// Fixed: Added the mint parameter
+			const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+				payer.publicKey, 
+				PayerTokenATA, 
+				payer.publicKey, 
+				new PublicKey(poolInfo.mint)
+			);
 
 			const TokenATA = await spl.getAssociatedTokenAddress(new PublicKey(poolInfo.mint), wallet.publicKey);
 			const transferIx = spl.createTransferInstruction(TokenATA, PayerTokenATA, wallet.publicKey, transferAmount);
@@ -174,6 +180,10 @@ export async function sellXPercentageRAY() {
 
 			if (isFirstChunk) {
 				versionedTx.sign([wallet]); // Sign with the dev wallet for the first chunk
+			}
+
+			for (let keypair of chunk) {
+				versionedTx.sign([keypair]); // Then sign with each keypair in the chunk
 			}
 
 			bundledTxns.push(versionedTx);
