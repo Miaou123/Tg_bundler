@@ -38,7 +38,7 @@ async function createWalletSwaps(
 	mint: PublicKey
 ): Promise<VersionedTransaction[]> {
 	const txsSigned: VersionedTransaction[] = [];
-	const chunkedKeypairs = chunkArray(keypairs, 6);
+	const chunkedKeypairs = chunkArray(keypairs, 4); // Reduced chunk size for debugging
 
 	// Load keyInfo data from JSON file
 	let keyInfo: { [key: string]: { solAmount: number; tokenAmount: string; percentSupply: number } } = {};
@@ -47,88 +47,173 @@ async function createWalletSwaps(
 		keyInfo = JSON.parse(existingData);
 	}
 
+	console.log(`Creating ${chunkedKeypairs.length} chunks of transactions`);
+
+	// Pre-calculate PDAs once
+	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBytes()], PUMP_PROGRAM);
+	const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+		[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
+		spl.ASSOCIATED_TOKEN_PROGRAM_ID
+	);
+
+	console.log(`Bonding Curve: ${bondingCurve.toBase58()}`);
+	console.log(`Associated Bonding Curve: ${associatedBondingCurve.toBase58()}`);
+
 	// Iterate over each chunk of keypairs
 	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
 		const chunk = chunkedKeypairs[chunkIndex];
 		const instructionsForChunk: TransactionInstruction[] = [];
 
+		console.log(`\n--- Processing Chunk ${chunkIndex + 1}/${chunkedKeypairs.length} ---`);
+
 		// Iterate over each keypair in the chunk to create swap instructions
 		for (let i = 0; i < chunk.length; i++) {
 			const keypair = chunk[i];
-			console.log(`Processing keypair ${i + 1}/${chunk.length}:`, keypair.publicKey.toString());
-
-			const ataAddress = await spl.getAssociatedTokenAddress(mint, keypair.publicKey);
-			const createTokenAta = spl.createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, ataAddress, keypair.publicKey, mint);
+			console.log(`Processing keypair ${i + 1}/${chunk.length}: ${keypair.publicKey.toString()}`);
 
 			// Extract tokenAmount from keyInfo for this keypair
 			const keypairInfo = keyInfo[keypair.publicKey.toString()];
 			if (!keypairInfo) {
-				console.log(`No key info found for keypair: ${keypair.publicKey.toString()}`);
+				console.log(`❌ No key info found for keypair: ${keypair.publicKey.toString()}`);
 				continue;
 			}
 
-			// Calculate SOL amount based on tokenAmount
+			const ataAddress = await spl.getAssociatedTokenAddress(mint, keypair.publicKey);
+			console.log(`  ATA Address: ${ataAddress.toBase58()}`);
+
+			// Always create ATA instruction (idempotent - won't fail if exists)
+			console.log(`  Creating ATA for ${keypair.publicKey.toString()}`);
+			const createTokenAta = spl.createAssociatedTokenAccountIdempotentInstruction(
+				payer.publicKey, 
+				ataAddress, 
+				keypair.publicKey, 
+				mint
+			);
+			instructionsForChunk.push(createTokenAta);
+
+			// Calculate amounts
 			const amount = new BN(keypairInfo.tokenAmount);
 			const solAmount = new BN(100000 * keypairInfo.solAmount * LAMPORTS_PER_SOL);
 
-			// Create buy instruction with Anchor (now with creator parameter)
-			const buyIx = await (program.methods as any)
-				.buy(amount, solAmount)
-				.accounts({
-					global: globalAccount,
-					feeRecipient: feeRecipient,
-					mint: mint,
-					bondingCurve: PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBytes()], PUMP_PROGRAM)[0],
-					associatedBondingCurve: PublicKey.findProgramAddressSync(
-						[PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBytes()], PUMP_PROGRAM)[0].toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
-						spl.ASSOCIATED_TOKEN_PROGRAM_ID
-					)[0],
-					associatedUser: ataAddress,
-					user: keypair.publicKey,
-					systemProgram: SystemProgram.programId,
-					tokenProgram: spl.TOKEN_PROGRAM_ID,
-					creatorVault: PublicKey.findProgramAddressSync([Buffer.from("creator-vault"), wallet.publicKey.toBytes()], PUMP_PROGRAM)[0],
-					eventAuthority: eventAuthority,
-					program: PUMP_PROGRAM,
-				})
-				.instruction();
+			console.log(`  Token Amount: ${amount.toString()}`);
+			console.log(`  SOL Amount: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
 
-			instructionsForChunk.push(createTokenAta, buyIx);
-		}
+			// Create buy instruction - CORRECT CREATOR VAULT DERIVATION
+			try {
+				const buyIx = await (program.methods as any)
+					.buy(amount, solAmount)
+					.accounts({
+						global: globalAccount,
+						feeRecipient: feeRecipient,
+						mint: mint,
+						bondingCurve: bondingCurve,
+						associatedBondingCurve: associatedBondingCurve,
+						associatedUser: ataAddress,
+						user: keypair.publicKey,
+						systemProgram: SystemProgram.programId,
+						tokenProgram: spl.TOKEN_PROGRAM_ID,
+						rent: SYSVAR_RENT_PUBKEY, // Added missing rent account
+						creatorVault: PublicKey.findProgramAddressSync(
+							[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
+							PUMP_PROGRAM
+						)[0], // ✅ Creator vault derived from wallet (creator)
+						eventAuthority: eventAuthority,
+						program: PUMP_PROGRAM,
+					})
+					.instruction();
 
-		const message = new TransactionMessage({
-			payerKey: payer.publicKey,
-			recentBlockhash: blockhash,
-			instructions: instructionsForChunk,
-		}).compileToV0Message([lut]);
+				instructionsForChunk.push(buyIx);
+				console.log(`  ✅ Created buy instruction for ${keypair.publicKey.toString()}`);
 
-		const versionedTx = new VersionedTransaction(message);
-
-		console.log("Txn size:", versionedTx.serialize().length);
-		if (versionedTx.serialize().length > 1232) {
-			console.log("tx too big");
-		}
-
-		// Sign with the keypairs for this chunk
-		for (const kp of chunk) {
-			if (kp.publicKey.toString() in keyInfo) {
-				versionedTx.sign([kp]);
+			} catch (error) {
+				console.error(`  ❌ Error creating buy instruction for ${keypair.publicKey.toString()}:`, error);
+				continue;
 			}
 		}
 
-		versionedTx.sign([payer]);
-		txsSigned.push(versionedTx);
+		if (instructionsForChunk.length === 0) {
+			console.log(`No valid instructions in chunk ${chunkIndex + 1}, skipping`);
+			continue;
+		}
+
+		console.log(`Creating transaction with ${instructionsForChunk.length} instructions`);
+
+		try {
+			const message = new TransactionMessage({
+				payerKey: payer.publicKey,
+				recentBlockhash: blockhash,
+				instructions: instructionsForChunk,
+			}).compileToV0Message([lut]);
+
+			const versionedTx = new VersionedTransaction(message);
+
+			const serializedSize = versionedTx.serialize().length;
+			console.log(`Txn size: ${serializedSize} bytes`);
+			
+			if (serializedSize > 1232) {
+				console.log("❌ Transaction too big, skipping chunk");
+				continue;
+			}
+
+			// Sign with payer first
+			versionedTx.sign([payer]);
+
+			// Sign with the keypairs for this chunk
+			for (const kp of chunk) {
+				if (kp.publicKey.toString() in keyInfo) {
+					try {
+						versionedTx.sign([kp]);
+						console.log(`  ✅ Signed with ${kp.publicKey.toString()}`);
+					} catch (error) {
+						console.error(`  ❌ Error signing with ${kp.publicKey.toString()}:`, error);
+					}
+				}
+			}
+
+			// Simulate this transaction before adding to bundle
+			console.log(`\n--- Simulating Chunk ${chunkIndex + 1} Transaction ---`);
+			try {
+				const simulationResult = await connection.simulateTransaction(versionedTx, { 
+					commitment: "processed",
+					sigVerify: false
+				});
+
+				if (simulationResult.value.err) {
+					console.error(`❌ Chunk ${chunkIndex + 1} simulation error:`, simulationResult.value.err);
+					console.log("Logs:");
+					const logs = simulationResult.value.logs || [];
+					logs.forEach((log, i) => console.log(`    ${i}: ${log}`));
+					continue; // Skip this chunk
+				} else {
+					console.log(`✅ Chunk ${chunkIndex + 1} simulation success!`);
+				}
+			} catch (error) {
+				console.error(`❌ Error simulating chunk ${chunkIndex + 1}:`, error);
+				continue;
+			}
+
+			txsSigned.push(versionedTx);
+			console.log(`✅ Added chunk ${chunkIndex + 1} to bundle`);
+
+		} catch (error) {
+			console.error(`❌ Error creating transaction for chunk ${chunkIndex + 1}:`, error);
+			continue;
+		}
 	}
 
+	console.log(`\n=== Created ${txsSigned.length} valid transactions ===`);
 	return txsSigned;
 }
 
 export async function buyBundle() {
-	const provider = new anchor.AnchorProvider(new anchor.web3.Connection(rpc), new anchor.Wallet(wallet), { commitment: "confirmed" });
+    const provider = new anchor.AnchorProvider(
+        connection,
+        new anchor.Wallet(wallet),
+        { commitment: "confirmed" }
+    );
 
-	// Load the NEW IDL format directly (no conversion needed with latest Anchor)
-	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
-	const program = new anchor.Program(IDL_PumpFun as anchor.Idl, PUMP_PROGRAM, provider);
+    const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
+    const program = new anchor.Program(IDL_PumpFun, provider);
 
 	let keyInfo: { [key: string]: any } = {};
 	if (fs.existsSync(keyInfoPath)) {
@@ -136,13 +221,23 @@ export async function buyBundle() {
 		keyInfo = JSON.parse(existingData);
 	}
 
+	console.log("=== DEBUG: Checking Required Accounts ===");
+	console.log(`Wallet: ${wallet.publicKey.toString()}`);
+	console.log(`Payer: ${payer.publicKey.toString()}`);
+	console.log(`Global: ${globalAccount.toString()}`);
+	console.log(`Fee Recipient: ${feeRecipient.toString()}`);
+	console.log(`Event Authority: ${eventAuthority.toString()}`);
+	console.log(`Mint Authority: ${mintAuthority.toString()}`);
+
 	const lut = new PublicKey(keyInfo.addressLUT.toString());
 	const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
 
 	if (lookupTableAccount == null) {
-		console.log("Lookup table account not found!");
+		console.log("❌ Lookup table account not found!");
 		process.exit(0);
 	}
+
+	console.log(`✅ Lookup table found: ${lut.toString()}`);
 
 	// -------- step 1: ask necessary questions for pool build --------
 	const name = prompt("Name of your token: ");
@@ -157,20 +252,21 @@ export async function buyBundle() {
 	console.log("\n=== UPLOADING METADATA ===");
 	const files = await fs.promises.readdir("./img");
 	if (files.length == 0) {
-		console.log("No image found in the img folder");
+		console.log("❌ No image found in the img folder");
 		return;
 	}
 	if (files.length > 1) {
-		console.log("Multiple images found in the img folder, please only keep one image");
+		console.log("❌ Multiple images found in the img folder, please only keep one image");
 		return;
 	}
-	const data: Buffer = fs.readFileSync(`./img/${files[0]}`);
 
+	const data: Buffer = fs.readFileSync(`./img/${files[0]}`);
 	let formData = new FormData();
+	
 	if (data) {
 		formData.append("file", new Blob([data], { type: "image/jpeg" }));
 	} else {
-		console.log("No image found");
+		console.log("❌ No image found");
 		return;
 	}
 
@@ -208,15 +304,20 @@ export async function buyBundle() {
 	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
 	console.log(`Using mint: ${mintKp.publicKey.toBase58()}`);
 
-	// -------- step 4: create the token with Anchor (WITH creator parameter) --------
+	// -------- step 4: create the token (SIMPLIFIED - NO CREATOR PARAMETER) --------
 	console.log("\n=== CREATING TOKEN WITH ANCHOR ===");
 	
 	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
 	const [metadata] = PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], MPL_TOKEN_METADATA_PROGRAM_ID);
 	const [associatedBondingCurve] = PublicKey.findProgramAddressSync([bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], spl.ASSOCIATED_TOKEN_PROGRAM_ID);
 
+	console.log(`Bonding Curve: ${bondingCurve.toBase58()}`);
+	console.log(`Metadata: ${metadata.toBase58()}`);
+	console.log(`Associated Bonding Curve: ${associatedBondingCurve.toBase58()}`);
+
+	// CREATE INSTRUCTION - WITH REQUIRED CREATOR PARAMETER
 	const createIx = await (program.methods as any)
-		.create(name, symbol, metadata_uri, wallet.publicKey) // ✅ WITH creator parameter
+		.create(name, symbol, metadata_uri, wallet.publicKey) // ✅ CREATOR PARAMETER REQUIRED
 		.accounts({
 			mint: mintKp.publicKey,
 			mintAuthority: mintAuthority,
@@ -253,6 +354,7 @@ export async function buyBundle() {
 
 	console.log(`Dev wallet buying ${amount.toString()} tokens for ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
 
+	// CORRECT BUY INSTRUCTION - Need to get creator from bonding curve first
 	const buyIx = await (program.methods as any)
 		.buy(amount, solAmount)
 		.accounts({
@@ -265,7 +367,11 @@ export async function buyBundle() {
 			user: wallet.publicKey,
 			systemProgram: SystemProgram.programId,
 			tokenProgram: spl.TOKEN_PROGRAM_ID,
-			creatorVault: PublicKey.findProgramAddressSync([Buffer.from("creator-vault"), wallet.publicKey.toBytes()], PUMP_PROGRAM)[0],
+			rent: SYSVAR_RENT_PUBKEY, // Added missing rent account
+			creatorVault: PublicKey.findProgramAddressSync(
+				[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
+				PUMP_PROGRAM
+			)[0], // ✅ Creator vault derived from wallet (creator)
 			eventAuthority: eventAuthority,
 			program: PUMP_PROGRAM,
 		})
@@ -320,19 +426,23 @@ export async function buyBundle() {
 
 	// -------- step 6: send bundle --------
 	console.log(`\n=== SENDING BUNDLE WITH ${bundledTxns.length} TRANSACTIONS ===`);
+	
+	// Additional check
+	if (bundledTxns.length > 5) {
+		console.log(`❌ Bundle has ${bundledTxns.length} transactions, reducing to first 5`);
+		bundledTxns.splice(5); // Keep only first 5
+	}
+
 	await sendBundle(bundledTxns);
 }
 
 export async function sendBundle(bundledTxns: VersionedTransaction[]) {
 	if (bundledTxns.length === 0) {
-		console.log("No transactions to send in bundle");
+		console.log("❌ No transactions to send in bundle");
 		return;
 	}
 
-	if (bundledTxns.length > 5) {
-		console.log(`❌ Bundle has ${bundledTxns.length} transactions, max is 5!`);
-		return;
-	}
+	console.log(`Sending bundle with ${bundledTxns.length} transactions`);
 
 	try {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
@@ -341,7 +451,7 @@ export async function sendBundle(bundledTxns: VersionedTransaction[]) {
 		// Listen for bundle result with timeout
 		const result = await new Promise((resolve, reject) => {
 			const timeout = setTimeout(() => {
-				reject(new Error("Bundle result timeout"));
+				reject(new Error("Bundle result timeout after 30 seconds"));
 			}, 30000);
 
 			searcherClient.onBundleResult(
@@ -364,7 +474,7 @@ export async function sendBundle(bundledTxns: VersionedTransaction[]) {
 		console.error("❌ Error sending bundle:", err.message);
 
 		if (err?.message?.includes("Bundle Dropped, no connected leader up soon")) {
-			console.error("Bundle dropped - no connected leader up soon.");
+			console.error("Bundle dropped - no connected leader up soon. Try again in a few seconds.");
 		} else if (err?.message?.includes("exceeded maximum number of transactions")) {
 			console.error("Bundle size exceeded maximum limit.");
 		} else if (err?.message?.includes("Bundles must write lock at least one tip account")) {

@@ -41,7 +41,7 @@ export async function sellXPercentagePF() {
 
 	// Initialize pumpfun anchor with corrected constructor
 	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
-	const pfprogram = new anchor.Program(IDL_PumpFun as anchor.Idl, PUMP_PROGRAM, provider);
+	const pfprogram = new anchor.Program(IDL_PumpFun, provider);
 
 	// Start selling
 	const bundledTxns = [];
@@ -95,7 +95,12 @@ export async function sellXPercentagePF() {
 			sellTotalAmount += transferAmount;
 			console.log(`Sending ${transferAmount / 1e6} from dev wallet.`);
 
-			const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, PayerTokenATA, payer.publicKey);
+			const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+				payer.publicKey, 
+				PayerTokenATA, 
+				payer.publicKey, 
+				new PublicKey(poolInfo.mint)  // Add the mint parameter
+			);
 
 			const TokenATA = await spl.getAssociatedTokenAddress(new PublicKey(poolInfo.mint), wallet.publicKey);
 			const transferIx = spl.createTransferInstruction(TokenATA, PayerTokenATA, wallet.publicKey, transferAmount);
