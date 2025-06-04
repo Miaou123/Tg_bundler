@@ -1,4 +1,4 @@
-import { connection, wallet, PUMP_PROGRAM, feeRecipient, eventAuthority, global, MPL_TOKEN_METADATA_PROGRAM_ID, mintAuthority, rpc, payer } from "../config";
+import { connection, wallet, PUMP_PROGRAM, feeRecipient, eventAuthority, global as globalAccount, MPL_TOKEN_METADATA_PROGRAM_ID, mintAuthority, rpc, payer } from "../config";
 import {
 	PublicKey,
 	VersionedTransaction,
@@ -18,322 +18,117 @@ import * as spl from "@solana/spl-token";
 import bs58 from "bs58";
 import path from "path";
 import fs from "fs";
-import { Program } from "@coral-xyz/anchor";
 import { getRandomTipAccount } from "./clients/config";
 import BN from "bn.js";
 import axios from "axios";
 import * as anchor from "@coral-xyz/anchor";
-import { sha256 } from "@noble/hashes/sha256";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
 
-function calculateDiscriminator(instruction: string): Buffer {
-    // Use the actual discriminator from working Pump.Fun transactions
-    if (instruction === "create") {
-        return Buffer.from("114ca4929b2a32b1", "hex");
-    }
-    // Fallback to standard Anchor calculation for other instructions
-    return Buffer.from(sha256(`global:${instruction}`)).slice(0, 8);
+function chunkArray<T>(array: T[], size: number): T[][] {
+	return Array.from({ length: Math.ceil(array.length / size) }, (v, i) => array.slice(i * size, i * size + size));
 }
 
-function createRawCreateInstruction(
-    mintKp: Keypair,
-    name: string,
-    symbol: string,
-    metadata_uri: string
-): TransactionInstruction {
-    
-    // Use the correct discriminator format
-    const discriminator = calculateDiscriminator("create");
-    
-    // Serialize arguments using manual Borsh format for strings
-    // Borsh string format: 4-byte little-endian length + UTF-8 bytes
-    const nameBuffer = Buffer.from(name, 'utf8');
-    const nameLen = Buffer.alloc(4);
-    nameLen.writeUInt32LE(nameBuffer.length, 0);
-    
-    const symbolBuffer = Buffer.from(symbol, 'utf8');
-    const symbolLen = Buffer.alloc(4);
-    symbolLen.writeUInt32LE(symbolBuffer.length, 0);
-    
-    const uriBuffer = Buffer.from(metadata_uri, 'utf8');
-    const uriLen = Buffer.alloc(4);
-    uriLen.writeUInt32LE(uriBuffer.length, 0);
-    
-    // Combine: discriminator + (length + data) for each string in Borsh format
-    const data = Buffer.concat([
-        discriminator,           // 8 bytes
-        nameLen,                // 4 bytes 
-        nameBuffer,             // name.length bytes
-        symbolLen,              // 4 bytes
-        symbolBuffer,           // symbol.length bytes  
-        uriLen,                 // 4 bytes
-        uriBuffer              // uri.length bytes
-    ]);
-    
-    console.log("Raw instruction Borsh serialization:");
-    console.log("  Discriminator:", discriminator.toString('hex'));
-    console.log("  Name length:", nameBuffer.length, "bytes");
-    console.log("  Symbol length:", symbolBuffer.length, "bytes"); 
-    console.log("  URI length:", uriBuffer.length, "bytes");
-    console.log("  Total data length:", data.length, "bytes");
-    
-    // Derive accounts
-    const [bondingCurve] = PublicKey.findProgramAddressSync(
-        [Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
-        PUMP_PROGRAM
-    );
-    const [metadata] = PublicKey.findProgramAddressSync(
-        [Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
-        MPL_TOKEN_METADATA_PROGRAM_ID
-    );
-    const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-        [bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
-        spl.ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-    
-    return new TransactionInstruction({
-        programId: PUMP_PROGRAM,
-        keys: [
-            { pubkey: mintKp.publicKey, isSigner: true, isWritable: true },
-            { pubkey: mintAuthority, isSigner: false, isWritable: false },
-            { pubkey: bondingCurve, isSigner: false, isWritable: true },
-            { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
-            { pubkey: global, isSigner: false, isWritable: false },
-            { pubkey: MPL_TOKEN_METADATA_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: metadata, isSigner: false, isWritable: true },
-            { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
-            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-            { pubkey: spl.TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: spl.ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-            { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
-            { pubkey: eventAuthority, isSigner: false, isWritable: false },
-            { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
-        ],
-        data: data,
-    });
-}
+async function createWalletSwaps(
+	program: anchor.Program,
+	blockhash: string,
+	keypairs: Keypair[],
+	lut: AddressLookupTableAccount,
+	mint: PublicKey
+): Promise<VersionedTransaction[]> {
+	const txsSigned: VersionedTransaction[] = [];
+	const chunkedKeypairs = chunkArray(keypairs, 6);
 
-async function testDiscriminator(program: anchor.Program, mintKp: Keypair, name: string, symbol: string, metadata_uri: string) {
-    console.log("\n=== TESTING DISCRIMINATOR ===");
-    
-    // Calculate expected discriminator
-    const expectedDiscriminator = calculateDiscriminator("create");
-    console.log("Expected create discriminator:", expectedDiscriminator.toString('hex'));
-    
-    // Check what Anchor generates
-    try {
-        const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
-        const [metadata] = PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], MPL_TOKEN_METADATA_PROGRAM_ID);
-        const [associatedBondingCurve] = PublicKey.findProgramAddressSync([bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], spl.ASSOCIATED_TOKEN_PROGRAM_ID);
-
-        const ix = await program.methods
-            .create(name, symbol, metadata_uri)
-            .accounts({
-                mint: mintKp.publicKey,
-                mintAuthority: mintAuthority,
-                bondingCurve: bondingCurve,
-                associatedBondingCurve: associatedBondingCurve,
-                global: global,
-                mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,
-                metadata: metadata,
-                user: wallet.publicKey,
-                systemProgram: SystemProgram.programId,
-                tokenProgram: spl.TOKEN_PROGRAM_ID,
-                associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
-                rent: SYSVAR_RENT_PUBKEY,
-                eventAuthority: eventAuthority,
-                program: PUMP_PROGRAM,
-            })
-            .instruction();
-        
-        const anchorDiscriminator = ix.data.slice(0, 8);
-        console.log("Anchor generated discriminator:", anchorDiscriminator.toString('hex'));
-        
-        // Compare
-        if (Buffer.compare(expectedDiscriminator, anchorDiscriminator) === 0) {
-            console.log("✅ Discriminators match!");
-        } else {
-            console.log("❌ Discriminator mismatch!");
-            console.log("Expected:", expectedDiscriminator.toString('hex'));
-            console.log("Anchor:  ", anchorDiscriminator.toString('hex'));
-        }
-        
-        // Let's also try checking a known working transaction
-        console.log("\n=== CHECKING KNOWN WORKING TRANSACTION ===");
-        try {
-            // This is a known working create transaction signature from the search results
-            const workingTxSig = "2nRAKcDF5MsXtvezRaUCNpQMbzSNacbJyxPKdWP2AEpSZMj41QJc7scwyr6aXVfT66q4ZkgHDqFjbBXibwAtatnz";
-            const workingTx = await connection.getParsedTransaction(workingTxSig, { maxSupportedTransactionVersion: 0 });
-            
-            if (workingTx?.transaction.message.instructions) {
-                const pumpIx = workingTx.transaction.message.instructions.find(ix => 
-                    'programId' in ix && ix.programId.equals(PUMP_PROGRAM)
-                );
-                
-                if (pumpIx && 'data' in pumpIx) {
-                    const workingData = Buffer.from(pumpIx.data, 'base64');
-                    const workingDiscriminator = workingData.slice(0, 8);
-                    console.log("Working transaction discriminator:", workingDiscriminator.toString('hex'));
-                    
-                    if (Buffer.compare(expectedDiscriminator, workingDiscriminator) === 0) {
-                        console.log("✅ Our expected discriminator matches working transaction!");
-                    } else {
-                        console.log("❌ Our expected discriminator doesn't match working transaction!");
-                        console.log("Working:  ", workingDiscriminator.toString('hex'));
-                        console.log("Expected: ", expectedDiscriminator.toString('hex'));
-                    }
-                }
-            }
-        } catch (err) {
-            console.log("Could not fetch working transaction (might be old)");
-        }
-        
-    } catch (error) {
-        console.log("❌ Error creating instruction for discriminator test:", error);
-    }
-}
-
-async function debugCreateInstruction(program: anchor.Program, mintKp: Keypair, name: string, symbol: string, metadata_uri: string) {
-	console.log("\n=== DEBUGGING CREATE INSTRUCTION ===");
-	
-	// Derive all accounts step by step
-	const [bondingCurve] = PublicKey.findProgramAddressSync(
-		[Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
-		PUMP_PROGRAM
-	);
-	console.log("✓ Bonding Curve:", bondingCurve.toString());
-
-	const [metadata] = PublicKey.findProgramAddressSync(
-		[Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
-		MPL_TOKEN_METADATA_PROGRAM_ID
-	);
-	console.log("✓ Metadata:", metadata.toString());
-
-	const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-		[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
-		spl.ASSOCIATED_TOKEN_PROGRAM_ID
-	);
-	console.log("✓ Associated Bonding Curve:", associatedBondingCurve.toString());
-
-	// Check if accounts already exist
-	console.log("\n=== CHECKING ACCOUNT EXISTENCE ===");
-	
-	try {
-		const mintAccount = await connection.getAccountInfo(mintKp.publicKey);
-		if (mintAccount) {
-			console.log("❌ Mint already exists:", mintKp.publicKey.toString());
-			console.log("   This mint cannot be used for token creation!");
-			return null;
-		}
-		console.log("✓ Mint is new:", mintKp.publicKey.toString());
-	} catch (e) {
-		console.log("✓ Mint is new:", mintKp.publicKey.toString());
+	// Load keyInfo data from JSON file
+	let keyInfo: { [key: string]: { solAmount: number; tokenAmount: string; percentSupply: number } } = {};
+	if (fs.existsSync(keyInfoPath)) {
+		const existingData = fs.readFileSync(keyInfoPath, "utf-8");
+		keyInfo = JSON.parse(existingData);
 	}
 
-	try {
-		const bondingCurveAccount = await connection.getAccountInfo(bondingCurve);
-		if (bondingCurveAccount) {
-			console.log("❌ Bonding curve already exists!");
-			return null;
-		}
-		console.log("✓ Bonding curve is new");
-	} catch (e) {
-		console.log("✓ Bonding curve is new");
-	}
+	// Iterate over each chunk of keypairs
+	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
+		const chunk = chunkedKeypairs[chunkIndex];
+		const instructionsForChunk: TransactionInstruction[] = [];
 
-	try {
-		const metadataAccount = await connection.getAccountInfo(metadata);
-		if (metadataAccount) {
-			console.log("❌ Metadata already exists!");
-			return null;
-		}
-		console.log("✓ Metadata is new");
-	} catch (e) {
-		console.log("✓ Metadata is new");
-	}
+		// Iterate over each keypair in the chunk to create swap instructions
+		for (let i = 0; i < chunk.length; i++) {
+			const keypair = chunk[i];
+			console.log(`Processing keypair ${i + 1}/${chunk.length}:`, keypair.publicKey.toString());
 
-	// Check global account
-	try {
-		const globalAccount = await connection.getAccountInfo(global);
-		if (!globalAccount) {
-			console.log("❌ Global account does not exist!");
-			return null;
-		}
-		console.log("✓ Global account exists");
-	} catch (e) {
-		console.log("❌ Error checking global account:", e);
-		return null;
-	}
+			const ataAddress = await spl.getAssociatedTokenAddress(mint, keypair.publicKey);
+			const createTokenAta = spl.createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, ataAddress, keypair.publicKey, mint);
 
-	// Verify all constants
-	console.log("\n=== VERIFYING CONSTANTS ===");
-	console.log("PUMP_PROGRAM:", PUMP_PROGRAM.toString());
-	console.log("MPL_TOKEN_METADATA_PROGRAM_ID:", MPL_TOKEN_METADATA_PROGRAM_ID.toString());
-	console.log("global:", global.toString());
-	console.log("mintAuthority:", mintAuthority.toString());
-	console.log("eventAuthority:", eventAuthority.toString());
-	console.log("wallet.publicKey:", wallet.publicKey.toString());
-
-	// Create the instruction with detailed logging
-	console.log("\n=== CREATING INSTRUCTION ===");
-	
-	const accountsObject = {
-		mint: mintKp.publicKey,
-		mintAuthority: mintAuthority,
-		bondingCurve: bondingCurve,
-		associatedBondingCurve: associatedBondingCurve,
-		global: global,
-		mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,
-		metadata: metadata,
-		user: wallet.publicKey,
-		systemProgram: SystemProgram.programId,
-		tokenProgram: spl.TOKEN_PROGRAM_ID,
-		associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
-		rent: SYSVAR_RENT_PUBKEY,
-		eventAuthority: eventAuthority,
-		program: PUMP_PROGRAM,
-	};
-
-	console.log("Accounts object:");
-	Object.entries(accountsObject).forEach(([key, value]) => {
-		console.log(`  ${key}: ${value.toString()}`);
-	});
-	console.log("Arguments:", { name, symbol, metadata_uri });
-
-	try {
-		const createIx = await program.methods
-			.create(name, symbol, metadata_uri)
-			.accounts(accountsObject)
-			.instruction();
-		
-		console.log("✅ Instruction created successfully");
-		console.log("Instruction keys:");
-		createIx.keys.forEach((k, i) => {
-			console.log(`  ${i}: ${k.pubkey.toString()} (writable: ${k.isWritable}, signer: ${k.isSigner})`);
-		});
-		
-		return {
-			instruction: createIx,
-			accounts: {
-				bondingCurve,
-				metadata,
-				associatedBondingCurve
+			// Extract tokenAmount from keyInfo for this keypair
+			const keypairInfo = keyInfo[keypair.publicKey.toString()];
+			if (!keypairInfo) {
+				console.log(`No key info found for keypair: ${keypair.publicKey.toString()}`);
+				continue;
 			}
-		};
-	} catch (error) {
-		console.log("❌ Error creating instruction:", error);
-		return null;
+
+			// Calculate SOL amount based on tokenAmount
+			const amount = new BN(keypairInfo.tokenAmount);
+			const solAmount = new BN(100000 * keypairInfo.solAmount * LAMPORTS_PER_SOL);
+
+			// Create buy instruction with Anchor (now with creator parameter)
+			const buyIx = await (program.methods as any)
+				.buy(amount, solAmount)
+				.accounts({
+					global: globalAccount,
+					feeRecipient: feeRecipient,
+					mint: mint,
+					bondingCurve: PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBytes()], PUMP_PROGRAM)[0],
+					associatedBondingCurve: PublicKey.findProgramAddressSync(
+						[PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBytes()], PUMP_PROGRAM)[0].toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
+						spl.ASSOCIATED_TOKEN_PROGRAM_ID
+					)[0],
+					associatedUser: ataAddress,
+					user: keypair.publicKey,
+					systemProgram: SystemProgram.programId,
+					tokenProgram: spl.TOKEN_PROGRAM_ID,
+					creatorVault: PublicKey.findProgramAddressSync([Buffer.from("creator-vault"), wallet.publicKey.toBytes()], PUMP_PROGRAM)[0],
+					eventAuthority: eventAuthority,
+					program: PUMP_PROGRAM,
+				})
+				.instruction();
+
+			instructionsForChunk.push(createTokenAta, buyIx);
+		}
+
+		const message = new TransactionMessage({
+			payerKey: payer.publicKey,
+			recentBlockhash: blockhash,
+			instructions: instructionsForChunk,
+		}).compileToV0Message([lut]);
+
+		const versionedTx = new VersionedTransaction(message);
+
+		console.log("Txn size:", versionedTx.serialize().length);
+		if (versionedTx.serialize().length > 1232) {
+			console.log("tx too big");
+		}
+
+		// Sign with the keypairs for this chunk
+		for (const kp of chunk) {
+			if (kp.publicKey.toString() in keyInfo) {
+				versionedTx.sign([kp]);
+			}
+		}
+
+		versionedTx.sign([payer]);
+		txsSigned.push(versionedTx);
 	}
+
+	return txsSigned;
 }
 
 export async function buyBundle() {
 	const provider = new anchor.AnchorProvider(new anchor.web3.Connection(rpc), new anchor.Wallet(wallet), { commitment: "confirmed" });
 
-	// Initialize pumpfun anchor
-	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8")) as anchor.Idl;
-	const program = new anchor.Program(IDL_PumpFun, PUMP_PROGRAM, provider);
+	// Load the NEW IDL format directly (no conversion needed with latest Anchor)
+	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
+	const program = new anchor.Program(IDL_PumpFun as anchor.Idl, PUMP_PROGRAM, provider);
 
 	let keyInfo: { [key: string]: any } = {};
 	if (fs.existsSync(keyInfoPath)) {
@@ -349,7 +144,7 @@ export async function buyBundle() {
 		process.exit(0);
 	}
 
-	// -------- step 1: ask necessary questions --------
+	// -------- step 1: ask necessary questions for pool build --------
 	const name = prompt("Name of your token: ");
 	const symbol = prompt("Symbol of your token: ");
 	const description = prompt("Description of your token: ");
@@ -396,129 +191,136 @@ export async function buyBundle() {
 		});
 		metadata_uri = response.data.metadataUri;
 		console.log("✅ Metadata uploaded successfully");
-		console.log("Metadata URI:", metadata_uri);
+		console.log("Metadata URI: ", metadata_uri);
 	} catch (error) {
 		console.error("❌ Error uploading metadata:", error);
 		return;
 	}
 
-	// -------- step 3: generate fresh mint --------
-	console.log("\n=== GENERATING FRESH MINT ===");
-	// ALWAYS generate a fresh mint for token creation
-	const mintKp = Keypair.generate();
-	console.log(`Generated fresh mint: ${mintKp.publicKey.toBase58()}`);
+	// -------- step 3: use existing mint --------
+	console.log("\n=== USING MINT FROM KEYINFO ===");
 	
-	// Save to keyInfo for future reference
-	keyInfo.mint = mintKp.publicKey.toString();
-	keyInfo.mintPk = bs58.encode(mintKp.secretKey);
-	fs.writeFileSync(keyInfoPath, JSON.stringify(keyInfo, null, 2));
+	if (!keyInfo.mintPk) {
+		console.log("❌ No mint found in keyInfo. Please run 'Extend LUT Bundle' first.");
+		return;
+	}
+	
+	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
+	console.log(`Using mint: ${mintKp.publicKey.toBase58()}`);
 
-	// -------- step 4: debug the create instruction --------
-	const debugResult = await debugCreateInstruction(program, mintKp, name, symbol, metadata_uri);
+	// -------- step 4: create the token with Anchor (WITH creator parameter) --------
+	console.log("\n=== CREATING TOKEN WITH ANCHOR ===");
 	
-	if (!debugResult) {
-		console.log("❌ Failed to create instruction, aborting");
+	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
+	const [metadata] = PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], MPL_TOKEN_METADATA_PROGRAM_ID);
+	const [associatedBondingCurve] = PublicKey.findProgramAddressSync([bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], spl.ASSOCIATED_TOKEN_PROGRAM_ID);
+
+	const createIx = await (program.methods as any)
+		.create(name, symbol, metadata_uri, wallet.publicKey) // ✅ WITH creator parameter
+		.accounts({
+			mint: mintKp.publicKey,
+			mintAuthority: mintAuthority,
+			bondingCurve: bondingCurve,
+			associatedBondingCurve: associatedBondingCurve,
+			global: globalAccount,
+			mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,
+			metadata: metadata,
+			user: wallet.publicKey,
+			systemProgram: SystemProgram.programId,
+			tokenProgram: spl.TOKEN_PROGRAM_ID,
+			associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+			rent: SYSVAR_RENT_PUBKEY,
+			eventAuthority: eventAuthority,
+			program: PUMP_PROGRAM,
+		})
+		.instruction();
+
+	// Get the associated token address for dev wallet
+	const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
+	const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, ata, wallet.publicKey, mintKp.publicKey);
+
+	// Extract tokenAmount from keyInfo for dev wallet
+	const keypairInfo = keyInfo[wallet.publicKey.toString()];
+	if (!keypairInfo) {
+		console.log(`❌ No key info found for dev wallet: ${wallet.publicKey.toString()}`);
+		console.log("Please run the simulation first to set buy amounts.");
 		return;
 	}
 
-	// -------- step 5: test discriminator --------
-	await testDiscriminator(program, mintKp, name, symbol, metadata_uri);
+	// Calculate SOL amount based on tokenAmount for dev wallet
+	const amount = new BN(keypairInfo.tokenAmount);
+	const solAmount = new BN(100000 * keypairInfo.solAmount * LAMPORTS_PER_SOL);
 
-	console.log("\n✅ Debug completed successfully!");
-	
-	// -------- step 6: test raw instruction approach --------
-	console.log("\n=== TESTING RAW INSTRUCTION ===");
-	
-	const rawInstruction = createRawCreateInstruction(mintKp, name, symbol, metadata_uri);
-	console.log("✅ Raw instruction created");
-	console.log("Raw instruction data length:", rawInstruction.data.length);
-	console.log("Raw instruction discriminator:", rawInstruction.data.slice(0, 8).toString('hex'));
+	console.log(`Dev wallet buying ${amount.toString()} tokens for ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
 
-	// Test raw instruction
+	const buyIx = await (program.methods as any)
+		.buy(amount, solAmount)
+		.accounts({
+			global: globalAccount,
+			feeRecipient: feeRecipient,
+			mint: mintKp.publicKey,
+			bondingCurve: bondingCurve,
+			associatedBondingCurve: associatedBondingCurve,
+			associatedUser: ata,
+			user: wallet.publicKey,
+			systemProgram: SystemProgram.programId,
+			tokenProgram: spl.TOKEN_PROGRAM_ID,
+			creatorVault: PublicKey.findProgramAddressSync([Buffer.from("creator-vault"), wallet.publicKey.toBytes()], PUMP_PROGRAM)[0],
+			eventAuthority: eventAuthority,
+			program: PUMP_PROGRAM,
+		})
+		.instruction();
+
+	const tipIxn = SystemProgram.transfer({
+		fromPubkey: wallet.publicKey,
+		toPubkey: getRandomTipAccount(),
+		lamports: BigInt(tipAmt),
+	});
+
+	const initIxs: TransactionInstruction[] = [createIx, ataIx, buyIx, tipIxn];
+
 	const { blockhash } = await connection.getLatestBlockhash();
-	
-	const rawMessage = new TransactionMessage({
+
+	const messageV0 = new TransactionMessage({
 		payerKey: wallet.publicKey,
-		instructions: [rawInstruction],
+		instructions: initIxs,
 		recentBlockhash: blockhash,
-	}).compileToV0Message([lookupTableAccount]);
+	}).compileToV0Message();
 
-	const rawTx = new VersionedTransaction(rawMessage);
-	rawTx.sign([wallet, mintKp]);
+	const fullTX = new VersionedTransaction(messageV0);
+	fullTX.sign([wallet, mintKp]);
 
-	console.log("\n=== SIMULATING RAW INSTRUCTION ===");
+	console.log("\n=== SIMULATING CREATE + DEV BUY TRANSACTION ===");
 	try {
-		const simulationResult = await connection.simulateTransaction(rawTx, { 
+		const simulationResult = await connection.simulateTransaction(fullTX, { 
 			commitment: "processed",
 			sigVerify: false
 		});
 
 		if (simulationResult.value.err) {
-			console.error("❌ Raw instruction simulation error:", simulationResult.value.err);
+			console.error("❌ Create transaction simulation error:", simulationResult.value.err);
 			console.log("Logs:");
 			const logs = simulationResult.value.logs || [];
 			logs.forEach((log, i) => console.log(`  ${i}: ${log}`));
-		} else {
-			console.log("✅ Raw instruction simulation success!");
-			console.log("We found the issue! Using raw instruction instead of Anchor.");
-			
-			// If raw instruction works, use it for the bundle
-			const bundledTxns: VersionedTransaction[] = [];
-			bundledTxns.push(rawTx);
-			
-			console.log(`\n=== SENDING RAW INSTRUCTION BUNDLE ===`);
-			await sendBundle(bundledTxns);
-			return;
-		}
-	} catch (error) {
-		console.error("❌ Error during raw instruction simulation:", error);
-	}
-
-	// -------- step 7: if raw doesn't work, try anchor instruction anyway --------
-	console.log("\n=== TESTING ANCHOR INSTRUCTION ANYWAY ===");
-	const testMessage = new TransactionMessage({
-		payerKey: wallet.publicKey,
-		instructions: [debugResult.instruction],
-		recentBlockhash: blockhash,
-	}).compileToV0Message([lookupTableAccount]);
-
-	const testTx = new VersionedTransaction(testMessage);
-	testTx.sign([wallet, mintKp]);
-
-	console.log("Test transaction size:", testTx.serialize().length, "bytes");
-
-	console.log("\n=== SIMULATING ANCHOR INSTRUCTION ===");
-	try {
-		const simulationResult = await connection.simulateTransaction(testTx, { 
-			commitment: "processed",
-			sigVerify: false
-		});
-
-		if (simulationResult.value.err) {
-			console.error("❌ Anchor instruction simulation error:", simulationResult.value.err);
-			console.log("Logs:");
-			const logs = simulationResult.value.logs || [];
-			logs.forEach((log, i) => console.log(`  ${i}: ${log}`));
-			
-			console.log("\n❌ Both raw and Anchor instructions failed. The issue might be:");
-			console.log("1. Incorrect program constants");
-			console.log("2. Wrong account derivation logic");
-			console.log("3. Program state issues");
-			console.log("4. RPC/network issues");
-			
 			return;
 		} else {
-			console.log("✅ Anchor instruction simulation success!");
+			console.log("✅ Create transaction simulation success!");
 		}
 	} catch (error) {
-		console.error("❌ Error during anchor instruction simulation:", error);
+		console.error("❌ Error during create transaction simulation:", error);
 		return;
 	}
 
-	// If we get here, create the full bundle
-	console.log("\n=== CREATING FULL BUNDLE ===");
-	// Continue with the rest of the bundle creation logic...
-	// (rest of your bundle creation code would go here)
+	const bundledTxns: VersionedTransaction[] = [fullTX];
+
+	// -------- step 5: create wallet swap transactions --------
+	console.log("\n=== CREATING WALLET BUY TRANSACTIONS ===");
+	const txMainSwaps: VersionedTransaction[] = await createWalletSwaps(program, blockhash, loadKeypairs(), lookupTableAccount, mintKp.publicKey);
+	bundledTxns.push(...txMainSwaps);
+
+	// -------- step 6: send bundle --------
+	console.log(`\n=== SENDING BUNDLE WITH ${bundledTxns.length} TRANSACTIONS ===`);
+	await sendBundle(bundledTxns);
 }
 
 export async function sendBundle(bundledTxns: VersionedTransaction[]) {

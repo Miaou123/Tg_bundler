@@ -1,4 +1,4 @@
-import { connection, rpc, wallet, global, feeRecipient, PUMP_PROGRAM, payer } from "../config";
+import { connection, rpc, wallet, global as globalAccount, feeRecipient, PUMP_PROGRAM, payer } from "../config";
 import { PublicKey, VersionedTransaction, SYSVAR_RENT_PUBKEY, TransactionMessage, SystemProgram, Keypair, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
 import { searcherClient } from "./clients/jito";
@@ -21,45 +21,9 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 }
 
 async function sendBundle(bundledTxns: VersionedTransaction[]) {
-	/*
-    // Simulate each transaction
-    for (const tx of bundledTxns) {
-        try {
-            const simulationResult = await connection.simulateTransaction(tx, { commitment: "processed" });
-
-            if (simulationResult.value.err) {
-                console.error("Simulation error for transaction:", simulationResult.value.err);
-            } else {
-                console.log("Simulation success for transaction. Logs:");
-                simulationResult.value.logs?.forEach(log => console.log(log));
-            }
-        } catch (error) {
-            console.error("Error during simulation:", error);
-        }
-    }
-    */
-
 	try {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
 		console.log(`Bundle ${bundleId} sent.`);
-
-		/*
-        // Assuming onBundleResult returns a Promise<BundleResult>
-        const result = await new Promise((resolve, reject) => {
-            searcherClient.onBundleResult(
-            (result) => {
-                console.log('Received bundle result:', result);
-                resolve(result); // Resolve the promise with the result
-            },
-            (e: Error) => {
-                console.error('Error receiving bundle result:', e);
-                reject(e); // Reject the promise if there's an error
-            }
-            );
-        });
-    
-        console.log('Result:', result);
-        */
 	} catch (error) {
 		const err = error as any;
 		console.error("Error sending bundle:", err.message);
@@ -75,14 +39,13 @@ async function sendBundle(bundledTxns: VersionedTransaction[]) {
 export async function sellXPercentagePF() {
 	const provider = new anchor.AnchorProvider(new anchor.web3.Connection(rpc), new anchor.Wallet(wallet), { commitment: "confirmed" });
 
-	// Initialize pumpfun anchor
-	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8")) as anchor.Idl;
-
-	const pfprogram = new anchor.Program(IDL_PumpFun, PUMP_PROGRAM, provider);
+	// Initialize pumpfun anchor with corrected constructor
+	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
+	const pfprogram = new anchor.Program(IDL_PumpFun as anchor.Idl, PUMP_PROGRAM, provider);
 
 	// Start selling
 	const bundledTxns = [];
-	const keypairs = loadKeypairs(); // Ensure this function is correctly defined to load your Keypairs
+	const keypairs = loadKeypairs();
 
 	let poolInfo: { [key: string]: any } = {};
 	if (fs.existsSync(keyInfoPath)) {
@@ -100,9 +63,8 @@ export async function sellXPercentagePF() {
 	}
 
 	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(poolInfo.mintPk)));
-	//console.log(`Mint: ${mintKp.publicKey.toBase58()}`);
 
-	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], pfprogram.programId);
+	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
 	let [associatedBondingCurve] = PublicKey.findProgramAddressSync(
 		[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
 		spl.ASSOCIATED_TOKEN_PROGRAM_ID
@@ -115,7 +77,7 @@ export async function sellXPercentagePF() {
 
 	let sellTotalAmount = 0;
 
-	const chunkedKeypairs = chunkArray(keypairs, 6); // Adjust chunk size as needed
+	const chunkedKeypairs = chunkArray(keypairs, 6);
 
 	// start the selling process
 	const PayerTokenATA = await spl.getAssociatedTokenAddress(new PublicKey(poolInfo.mint), payer.publicKey);
@@ -125,20 +87,15 @@ export async function sellXPercentagePF() {
 	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
 		const chunk = chunkedKeypairs[chunkIndex];
 		const instructionsForChunk = [];
-		const isFirstChunk = chunkIndex === 0; // Check if this is the first chunk
+		const isFirstChunk = chunkIndex === 0;
 
 		if (isFirstChunk) {
 			// Handle the first chunk separately
 			const transferAmount = await getSellBalance(wallet, new PublicKey(poolInfo.mint), supplyPercent);
-			sellTotalAmount += transferAmount; // Keep track to sell at the end
+			sellTotalAmount += transferAmount;
 			console.log(`Sending ${transferAmount / 1e6} from dev wallet.`);
 
-			const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
-				payer.publicKey, 
-				PayerTokenATA, 
-				payer.publicKey, 
-				new PublicKey(poolInfo.mint)  // ← Added missing mint parameter
-			);
+			const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(payer.publicKey, PayerTokenATA, payer.publicKey);
 
 			const TokenATA = await spl.getAssociatedTokenAddress(new PublicKey(poolInfo.mint), wallet.publicKey);
 			const transferIx = spl.createTransferInstruction(TokenATA, PayerTokenATA, wallet.publicKey, transferAmount);
@@ -148,7 +105,7 @@ export async function sellXPercentagePF() {
 
 		for (let keypair of chunk) {
 			const transferAmount = await getSellBalance(keypair, new PublicKey(poolInfo.mint), supplyPercent);
-			sellTotalAmount += transferAmount; // Keep track to sell at the end
+			sellTotalAmount += transferAmount;
 			console.log(`Sending ${transferAmount / 1e6} from ${keypair.publicKey.toString()}.`);
 
 			const TokenATA = await spl.getAssociatedTokenAddress(new PublicKey(poolInfo.mint), keypair.publicKey);
@@ -171,10 +128,10 @@ export async function sellXPercentagePF() {
 				console.log("tx too big");
 			}
 
-			versionedTx.sign([payer]); // Sign with payer first
+			versionedTx.sign([payer]);
 
 			for (let keypair of chunk) {
-				versionedTx.sign([keypair]); // Then sign with each keypair in the chunk
+				versionedTx.sign([keypair]);
 			}
 
 			bundledTxns.push(versionedTx);
@@ -189,24 +146,28 @@ export async function sellXPercentagePF() {
 	console.log(`TOTAL: Selling ${sellTotalAmount / 1e6}.`);
 
 	if (+mintInfo.value.amount * 0.25 <= sellTotalAmount) {
-		// protect investors from fraud and prevent illegal use
 		console.log("Price impact too high.");
 		console.log("Cannot sell more than 25% of supply at a time.");
-
 		return;
 	}
 
-	const sellIx = await pfprogram.methods
+	// Create sell instruction with new IDL (includes creatorVault)
+	const [creatorVault] = PublicKey.findProgramAddressSync([Buffer.from("creator-vault"), wallet.publicKey.toBytes()], PUMP_PROGRAM);
+
+	const sellIx = await (pfprogram.methods as any)
 		.sell(new BN(sellTotalAmount), new BN(0))
 		.accounts({
-			global,
+			global: globalAccount,
 			feeRecipient,
 			mint: new PublicKey(poolInfo.mint),
 			bondingCurve,
+			associatedBondingCurve,
+			associatedUser: PayerTokenATA,
 			user: payer.publicKey,
 			systemProgram: SystemProgram.programId,
-			associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+			creatorVault: creatorVault, // NEW account from updated IDL
 			tokenProgram: spl.TOKEN_PROGRAM_ID,
+			eventAuthority: PublicKey.findProgramAddressSync([Buffer.from("__event_authority")], PUMP_PROGRAM)[0],
 			program: PUMP_PROGRAM,
 		})
 		.instruction();

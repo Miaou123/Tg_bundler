@@ -9,18 +9,17 @@ import { getRandomTipAccount } from "./clients/config";
 import { lookupTableProvider } from "./clients/LookupTableProvider";
 import { loadKeypairs } from './createKeys';
 import * as spl from '@solana/spl-token';
-import idl from "../pumpfun-IDL.json";
-import { Program, Idl, AnchorProvider, setProvider } from "@coral-xyz/anchor";
-import { bs58 } from '@project-serum/anchor/dist/cjs/utils/bytes';
+// REMOVED: import idl from "../pumpfun-IDL.json";
+// REMOVED: import { Program, Idl, AnchorProvider, setProvider } from "@coral-xyz/anchor";
+import bs58 from 'bs58';
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, 'keyInfo.json');
 
-const provider = new AnchorProvider(connection, wallet as any, {});
-
-setProvider(provider);
-
-const program = new Program(idl as Idl, PUMP_PROGRAM);
+// REMOVED: Anchor provider setup since we don't need it for LUT creation
+// const provider = new AnchorProvider(connection, wallet as any, {});
+// setProvider(provider);
+// const program = new Program(idl as Idl, PUMP_PROGRAM);
 
 export async function extendLUT() {
     // -------- step 1: ask nessesary questions for LUT build --------
@@ -40,8 +39,6 @@ export async function extendLUT() {
     }
 
     const bundledTxns1: VersionedTransaction[] = [];
-    
-
 
     // -------- step 2: get all LUT addresses --------
     const accounts: PublicKey[] = []; // Array with all new keys to push to the new LUT
@@ -78,9 +75,11 @@ export async function extendLUT() {
         "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
     );
     const global = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+    
+    // Use manual PDA derivation instead of program.programId
     const [bondingCurve] = PublicKey.findProgramAddressSync(
         [Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()],
-        program.programId,
+        PUMP_PROGRAM, // Use the imported constant directly
     );
     const [metadata] = PublicKey.findProgramAddressSync(
         [
@@ -90,21 +89,20 @@ export async function extendLUT() {
         ],
         MPL_TOKEN_METADATA_PROGRAM_ID,
     );
-      let [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+    let [associatedBondingCurve] = PublicKey.findProgramAddressSync(
         [
           bondingCurve.toBytes(),
           spl.TOKEN_PROGRAM_ID.toBytes(),
           mintKp.publicKey.toBytes(),
         ],
         spl.ASSOCIATED_TOKEN_PROGRAM_ID,
-      );
-      const eventAuthority = new PublicKey(
+    );
+    const eventAuthority = new PublicKey(
         "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
-      );
-      const feeRecipient = new PublicKey(
+    );
+    const feeRecipient = new PublicKey(
         "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM",
-      );
-
+    );
 
     // These values vary based on the new market created
     accounts.push(
@@ -113,8 +111,7 @@ export async function extendLUT() {
         MPL_TOKEN_METADATA_PROGRAM_ID,
         mintAuthority,
         global,
-        program.programId,
-        PUMP_PROGRAM,
+        PUMP_PROGRAM, // Use the imported constant
         metadata,
         associatedBondingCurve,
         bondingCurve,
@@ -156,9 +153,6 @@ export async function extendLUT() {
         spl.NATIVE_MINT, 
     );
 
-
-
-    
     // -------- step 5: push LUT addresses to a txn --------
     const extendLUTixs1: TransactionInstruction[] = [];
     const extendLUTixs2: TransactionInstruction[] = [];
@@ -202,9 +196,6 @@ export async function extendLUT() {
         })
     );
 
-
-
-
     // -------- step 6: seperate into 2 different bundles to complete all txns --------
     const { blockhash: block1 } = await connection.getLatestBlockhash();
 
@@ -219,16 +210,10 @@ export async function extendLUT() {
         extend3,
         extend4,
     );
-    
-
 
     // -------- step 7: send bundle --------
     await sendBundle(bundledTxns1);
-    
 }
-
-
-
 
 export async function createLUT() {
 
@@ -243,8 +228,6 @@ export async function createLUT() {
     }
 
     const bundledTxns: VersionedTransaction[] = [];
-
-
 
     // -------- step 2: create a new LUT every time there is a new launch --------
     const createLUTixs: TransactionInstruction[] = [];
@@ -304,11 +287,9 @@ export async function createLUT() {
     // Push to bundle
     bundledTxns.push(createLUT);
 
-
     // -------- step 3: SEND BUNDLE --------
     await sendBundle(bundledTxns);
 }
-
 
 async function buildTxn(extendLUTixs: TransactionInstruction[], blockhash: string | Blockhash, lut: AddressLookupTableAccount): Promise<VersionedTransaction> {
     const messageMain = new TransactionMessage({
@@ -334,8 +315,6 @@ async function buildTxn(extendLUTixs: TransactionInstruction[], blockhash: strin
         return txn;
 }
 
-
-
 async function sendBundle(bundledTxns: VersionedTransaction[]) {
     try {
         const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
@@ -351,48 +330,3 @@ async function sendBundle(bundledTxns: VersionedTransaction[]) {
         }
     }
 }
-
-
-/*
-async function createAndSignVersionedTxNOLUT(
-    instructionsChunk: TransactionInstruction[], 
-    blockhash: Blockhash | string,
-): Promise<VersionedTransaction> {
-    const addressesMain: PublicKey[] = [];
-    instructionsChunk.forEach((ixn) => {
-        ixn.keys.forEach((key) => {
-            addressesMain.push(key.pubkey);
-        });
-    });
-
-    const lookupTablesMain1 =
-        lookupTableProvider.computeIdealLookupTablesForAddresses(addressesMain);
-
-    const message = new TransactionMessage({
-        payerKey: wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: instructionsChunk,
-    }).compileToV0Message(lookupTablesMain1);
-
-    const versionedTx = new VersionedTransaction(message);
-    const serializedMsg = versionedTx.serialize();
-
-    console.log("Txn size:", serializedMsg.length);
-    if (serializedMsg.length > 1232) { console.log('tx too big'); }
-    versionedTx.sign([wallet]);
-
-    
-    // Simulate each txn
-    const simulationResult = await connection.simulateTransaction(versionedTx, { commitment: "processed" });
-
-    if (simulationResult.value.err) {
-    console.log("Simulation error:", simulationResult.value.err);
-    } else {
-    console.log("Simulation success. Logs:");
-    simulationResult.value.logs?.forEach(log => console.log(log));
-    }
-    
-
-    return versionedTx;
-}
-*/
