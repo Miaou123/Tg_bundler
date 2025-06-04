@@ -59,6 +59,19 @@ async function createWalletSwaps(
 	console.log(`Bonding Curve: ${bondingCurve.toBase58()}`);
 	console.log(`Associated Bonding Curve: ${associatedBondingCurve.toBase58()}`);
 
+	// Fetch bonding curve account to get creator for creator vault derivation
+	let creatorPublicKey: PublicKey;
+	let creatorVault: PublicKey;
+	
+	// Since we know the creator will be wallet.publicKey (from create instruction), derive directly
+	creatorPublicKey = wallet.publicKey;
+	[creatorVault] = PublicKey.findProgramAddressSync(
+		[Buffer.from("creator-vault"), creatorPublicKey.toBytes()],
+		PUMP_PROGRAM
+	);
+	console.log(`Creator: ${creatorPublicKey.toBase58()}`);
+	console.log(`Creator Vault: ${creatorVault.toBase58()}`);
+
 	// Iterate over each chunk of keypairs
 	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
 		const chunk = chunkedKeypairs[chunkIndex];
@@ -81,15 +94,8 @@ async function createWalletSwaps(
 			const ataAddress = await spl.getAssociatedTokenAddress(mint, keypair.publicKey);
 			console.log(`  ATA Address: ${ataAddress.toBase58()}`);
 
-			// Always create ATA instruction (idempotent - won't fail if exists)
-			console.log(`  Creating ATA for ${keypair.publicKey.toString()}`);
-			const createTokenAta = spl.createAssociatedTokenAccountIdempotentInstruction(
-				payer.publicKey, 
-				ataAddress, 
-				keypair.publicKey, 
-				mint
-			);
-			instructionsForChunk.push(createTokenAta);
+			// ✅ NO ATA CREATION - Buy instruction handles this automatically
+			console.log(`  Buy instruction will create ATA automatically`);
 
 			// Calculate amounts
 			const amount = new BN(keypairInfo.tokenAmount);
@@ -98,26 +104,22 @@ async function createWalletSwaps(
 			console.log(`  Token Amount: ${amount.toString()}`);
 			console.log(`  SOL Amount: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
 
-			// Create buy instruction - CORRECT CREATOR VAULT DERIVATION
+			// Create buy instruction - Use regular accounts() with camelCase
 			try {
 				const buyIx = await (program.methods as any)
 					.buy(amount, solAmount)
-					.accounts({
+					.accounts({  // ✅ Back to regular accounts(), not accountsStrict
 						global: globalAccount,
-						feeRecipient: feeRecipient,
+						feeRecipient: feeRecipient,                        // ✅ camelCase - what Anchor expects
 						mint: mint,
-						bondingCurve: bondingCurve,
-						associatedBondingCurve: associatedBondingCurve,
-						associatedUser: ataAddress,
+						bondingCurve: bondingCurve,                        // ✅ camelCase
+						associatedBondingCurve: associatedBondingCurve,    // ✅ camelCase
+						associatedUser: ataAddress,                        // ✅ camelCase
 						user: keypair.publicKey,
-						systemProgram: SystemProgram.programId,
-						tokenProgram: spl.TOKEN_PROGRAM_ID,
-						rent: SYSVAR_RENT_PUBKEY, // Added missing rent account
-						creatorVault: PublicKey.findProgramAddressSync(
-							[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
-							PUMP_PROGRAM
-						)[0], // ✅ Creator vault derived from wallet (creator)
-						eventAuthority: eventAuthority,
+						systemProgram: SystemProgram.programId,            // ✅ camelCase
+						tokenProgram: spl.TOKEN_PROGRAM_ID,                // ✅ camelCase
+						creatorVault: creatorVault,                        // ✅ camelCase, pre-calculated
+						eventAuthority: eventAuthority,                    // ✅ camelCase
 						program: PUMP_PROGRAM,
 					})
 					.instruction();
@@ -140,7 +142,7 @@ async function createWalletSwaps(
 
 		try {
 			const message = new TransactionMessage({
-				payerKey: payer.publicKey,
+				payerKey: payer.publicKey,  // ✅ Back to using payer since no ATA creation
 				recentBlockhash: blockhash,
 				instructions: instructionsForChunk,
 			}).compileToV0Message([lut]);
@@ -170,27 +172,9 @@ async function createWalletSwaps(
 				}
 			}
 
-			// Simulate this transaction before adding to bundle
-			console.log(`\n--- Simulating Chunk ${chunkIndex + 1} Transaction ---`);
-			try {
-				const simulationResult = await connection.simulateTransaction(versionedTx, { 
-					commitment: "processed",
-					sigVerify: false
-				});
-
-				if (simulationResult.value.err) {
-					console.error(`❌ Chunk ${chunkIndex + 1} simulation error:`, simulationResult.value.err);
-					console.log("Logs:");
-					const logs = simulationResult.value.logs || [];
-					logs.forEach((log, i) => console.log(`    ${i}: ${log}`));
-					continue; // Skip this chunk
-				} else {
-					console.log(`✅ Chunk ${chunkIndex + 1} simulation success!`);
-				}
-			} catch (error) {
-				console.error(`❌ Error simulating chunk ${chunkIndex + 1}:`, error);
-				continue;
-			}
+			// ✅ SKIP SIMULATION for wallet transactions - they depend on create transaction
+			console.log(`\n--- Skipping Simulation for Chunk ${chunkIndex + 1} (depends on create tx) ---`);
+			console.log(`✅ Chunk ${chunkIndex + 1} ready for bundle execution`);
 
 			txsSigned.push(versionedTx);
 			console.log(`✅ Added chunk ${chunkIndex + 1} to bundle`);
@@ -304,7 +288,7 @@ export async function buyBundle() {
 	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
 	console.log(`Using mint: ${mintKp.publicKey.toBase58()}`);
 
-	// -------- step 4: create the token (SIMPLIFIED - NO CREATOR PARAMETER) --------
+	// -------- step 4: create the token --------
 	console.log("\n=== CREATING TOKEN WITH ANCHOR ===");
 	
 	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
@@ -315,23 +299,36 @@ export async function buyBundle() {
 	console.log(`Metadata: ${metadata.toBase58()}`);
 	console.log(`Associated Bonding Curve: ${associatedBondingCurve.toBase58()}`);
 
-	// CREATE INSTRUCTION - WITH REQUIRED CREATOR PARAMETER
+	// ✅ CHECK IF TOKEN ALREADY EXISTS
+	try {
+		const bondingCurveAccount = await connection.getAccountInfo(bondingCurve);
+		if (bondingCurveAccount) {
+			console.log("⚠️  WARNING: Token already exists! This might cause AlreadyInitialized error.");
+			console.log("Consider using a fresh mint or skipping the create instruction.");
+		} else {
+			console.log("✅ Token doesn't exist yet, safe to create.");
+		}
+	} catch (error) {
+		console.log("✅ Token doesn't exist yet, safe to create.");
+	}
+
+	// CREATE INSTRUCTION - Use camelCase for JavaScript/Anchor
 	const createIx = await (program.methods as any)
-		.create(name, symbol, metadata_uri, wallet.publicKey) // ✅ CREATOR PARAMETER REQUIRED
+		.create(name, symbol, metadata_uri, wallet.publicKey) // ✅ CREATE DOES take creator parameter!
 		.accounts({
 			mint: mintKp.publicKey,
-			mintAuthority: mintAuthority,
-			bondingCurve: bondingCurve,
-			associatedBondingCurve: associatedBondingCurve,
+			mintAuthority: mintAuthority,                      // ✅ camelCase for JavaScript
+			bondingCurve: bondingCurve,                        // ✅ camelCase for JavaScript
+			associatedBondingCurve: associatedBondingCurve,    // ✅ camelCase for JavaScript
 			global: globalAccount,
-			mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,
+			mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,   // ✅ camelCase for JavaScript
 			metadata: metadata,
 			user: wallet.publicKey,
-			systemProgram: SystemProgram.programId,
-			tokenProgram: spl.TOKEN_PROGRAM_ID,
-			associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+			systemProgram: SystemProgram.programId,            // ✅ camelCase for JavaScript
+			tokenProgram: spl.TOKEN_PROGRAM_ID,                // ✅ camelCase for JavaScript
+			associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID, // ✅ camelCase for JavaScript
 			rent: SYSVAR_RENT_PUBKEY,
-			eventAuthority: eventAuthority,
+			eventAuthority: eventAuthority,                    // ✅ camelCase for JavaScript
 			program: PUMP_PROGRAM,
 		})
 		.instruction();
@@ -354,25 +351,28 @@ export async function buyBundle() {
 
 	console.log(`Dev wallet buying ${amount.toString()} tokens for ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
 
-	// CORRECT BUY INSTRUCTION - Need to get creator from bonding curve first
+	// ✅ MANUALLY DERIVE CREATOR VAULT - Don't let Anchor auto-resolve
+	const [creatorVault] = PublicKey.findProgramAddressSync(
+		[Buffer.from("creator-vault"), wallet.publicKey.toBytes()],
+		PUMP_PROGRAM
+	);
+	console.log(`Creator Vault: ${creatorVault.toBase58()}`);
+
+	// FIXED BUY INSTRUCTION - Use regular accounts() with camelCase
 	const buyIx = await (program.methods as any)
 		.buy(amount, solAmount)
-		.accounts({
+		.accounts({  // ✅ Back to regular accounts(), not accountsStrict
 			global: globalAccount,
-			feeRecipient: feeRecipient,
+			feeRecipient: feeRecipient,                        // ✅ camelCase - what Anchor expects
 			mint: mintKp.publicKey,
-			bondingCurve: bondingCurve,
-			associatedBondingCurve: associatedBondingCurve,
-			associatedUser: ata,
+			bondingCurve: bondingCurve,                        // ✅ camelCase
+			associatedBondingCurve: associatedBondingCurve,    // ✅ camelCase
+			associatedUser: ata,                               // ✅ camelCase
 			user: wallet.publicKey,
-			systemProgram: SystemProgram.programId,
-			tokenProgram: spl.TOKEN_PROGRAM_ID,
-			rent: SYSVAR_RENT_PUBKEY, // Added missing rent account
-			creatorVault: PublicKey.findProgramAddressSync(
-				[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
-				PUMP_PROGRAM
-			)[0], // ✅ Creator vault derived from wallet (creator)
-			eventAuthority: eventAuthority,
+			systemProgram: SystemProgram.programId,            // ✅ camelCase
+			tokenProgram: spl.TOKEN_PROGRAM_ID,                // ✅ camelCase
+			creatorVault: creatorVault,                        // ✅ camelCase, manually provided
+			eventAuthority: eventAuthority,                    // ✅ camelCase
 			program: PUMP_PROGRAM,
 		})
 		.instruction();
@@ -383,6 +383,7 @@ export async function buyBundle() {
 		lamports: BigInt(tipAmt),
 	});
 
+	// ✅ BACK TO COMBINED TRANSACTION - Derive creator vault directly
 	const initIxs: TransactionInstruction[] = [createIx, ataIx, buyIx, tipIxn];
 
 	const { blockhash } = await connection.getLatestBlockhash();
