@@ -11,7 +11,7 @@ import bs58 from "bs58";
 // PRIV KEY OF DEPLOYER
 export const wallet = Keypair.fromSecretKey(
   bs58.decode(
-    "36LuxW9Y3J1tKR94xxe7dyMQ2gYoUCwjW1ZEhDKa9NtgwFPPfb5Bikonb48gxZofkPGywEaX9JcSVKo4U9F9W6Ld", 
+    "", 
   ),
 );
 
@@ -19,14 +19,14 @@ export const wallet = Keypair.fromSecretKey(
 // PRIV KEY OF FEEPAYER
 export const payer = Keypair.fromSecretKey(
   bs58.decode(
-    "3qJ9Ca5nDrnRQ43pjTqSEjc2CW3szQWyopRi3upyVVNyvKw7ZT52bCiqqTvPAZvqNQ5EYCEW6LbFvffJ4oaRADxV", 
+    "", 
   ),
 );
 
 
 // ENTER YOUR RPC
 export const rpc =
-  "https://mainnet.helius-rpc.com/?api-key=3b360dc5-2f4b-442a-b0bb-9e8feefece65"; 
+  ""; 
 
 
 
