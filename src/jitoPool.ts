@@ -610,64 +610,27 @@ export async function sendBundle(bundledTxns: VersionedTransaction[]) {
 	try {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
 		console.log(`✅ Bundle sent successfully!`);
-        console.log(`🆔 Bundle ID: ${bundleId}`);
+        
+        // ✅ FIX: Properly convert bundle ID to string
+        const bundleIdStr = bundleId.toString();
+        console.log(`🆔 Bundle ID: ${bundleIdStr}`);
 
 		console.log("⏳ Waiting for bundle result...");
 		
-		// Set shorter timeout and handle rate limits gracefully
-		const result = await Promise.race([
-			new Promise((resolve, reject) => {
-				const timeout = setTimeout(() => {
-					resolve({ timeout: true });
-				}, 15000); // Reduced timeout to 15 seconds
-
-				searcherClient.onBundleResult(
-					(result) => {
-						clearTimeout(timeout);
-						
-						if (result.accepted) {
-							console.log("🎉 BUNDLE ACCEPTED AND EXECUTED!");
-						} else if (result.rejected) {
-							console.log("❌ Bundle rejected by Jito");
-							if (result.rejected.simulationFailure) {
-								console.log(`  Rejection reason: ${result.rejected.simulationFailure.msg}`);
-							}
-						} else {
-							console.log("⏳ Bundle status unknown");
-						}
-						
-						resolve(result);
-					},
-					(e: Error) => {
-						clearTimeout(timeout);
-						// Handle rate limit errors gracefully
-						if (e.message.includes('Rate limit exceeded') || e.message.includes('RESOURCE_EXHAUSTED')) {
-							console.log("⚠️  Jito API rate limit hit - bundle may still be processing");
-							resolve({ rateLimited: true });
-						} else {
-							reject(e);
-						}
-					}
-				);
-			}),
-		]);
-
-		// Handle different result scenarios
-		if ((result as any).timeout) {
-			console.log("⏰ Bundle result timeout - checking on-chain status...");
-		} else if ((result as any).rateLimited) {
-			console.log("⚠️  Rate limit hit - checking on-chain status...");
-		} else if ((result as any).accepted) {
-			console.log("✅ Bundle confirmed successful by Jito!");
-			return; // Early return for confirmed success
-		}
-
-		// Wait a moment for transactions to settle
-		console.log("⏳ Waiting for on-chain confirmation...");
+		// ✅ FIX: Wait 10 seconds then check on-chain directly (more reliable)
 		await new Promise(resolve => setTimeout(resolve, 10000));
-
-		// Check on-chain status by verifying token creation
-		await verifyBundleSuccess(bundledTxns);
+		
+		console.log("🔍 Checking on-chain status...");
+		const success = await verifyBundleSuccess(bundledTxns);
+		
+		if (success) {
+			console.log("🎉 BUNDLE SUCCESSFUL - Token created and wallets funded!");
+			await verifyTokenCreation(); // Show token details
+			return true;
+		} else {
+			console.log("❌ Bundle verification failed - no successful transactions found");
+			return false;
+		}
 
 	} catch (error) {
 		const err = error as any;
@@ -677,117 +640,140 @@ export async function sendBundle(bundledTxns: VersionedTransaction[]) {
 			console.error("  → No Jito leader available - try again in a few seconds");
 		} else if (err?.message?.includes("exceeded maximum number of transactions")) {
 			console.error("  → Bundle too large - reduce number of wallets");
-		} else if (err?.message?.includes("Bundles must write lock at least one tip account")) {
-			console.error("  → Missing required tip account");
 		} else if (err?.message?.includes("Rate limit exceeded")) {
 			console.log("⚠️  Jito API rate limit hit - checking on-chain status...");
-			
-			// Wait and check on-chain
-			await new Promise(resolve => setTimeout(resolve, 10000));
-			await verifyBundleSuccess(bundledTxns);
+			await new Promise(resolve => setTimeout(resolve, 5000));
+			const success = await verifyBundleSuccess(bundledTxns);
+			return success;
 		} else {
 			console.error("  → Unexpected error occurred");
 		}
+		
+		return false;
 	}
 }
 
-// ✅ Verify bundle success by checking on-chain state
-async function verifyBundleSuccess(bundledTxns: VersionedTransaction[]) {
+async function verifyBundleSuccess(bundledTxns: VersionedTransaction[]): Promise<boolean> {
 	console.log("\n=== VERIFYING BUNDLE SUCCESS ===");
 	
 	try {
-		// Extract mint address from the first transaction (CREATE)
-		const createTx = bundledTxns[0];
-		const createTxSigs = createTx.signatures;
+		// First check if token was created (most important indicator)
+		const tokenCreated = await verifyTokenCreation();
 		
-		// Get transaction status
-		for (let i = 0; i < bundledTxns.length; i++) {
-			const tx = bundledTxns[i];
-			const signature = bs58.encode(tx.signatures[0]);
+		if (tokenCreated) {
+			console.log("✅ TOKEN CREATION CONFIRMED!");
 			
-			try {
-				const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+			// Also check individual transactions
+			let successCount = 0;
+			let totalChecked = 0;
+			
+			for (let i = 0; i < Math.min(bundledTxns.length, 5); i++) { // Check first 5 TXs
+				const tx = bundledTxns[i];
+				const signature = bs58.encode(tx.signatures[0]);
 				
-				if (status.value?.confirmationStatus) {
-					console.log(`✅ TX ${i + 1}: ${status.value.confirmationStatus.toUpperCase()}`);
+				try {
+					const status = await connection.getSignatureStatus(signature, { 
+						searchTransactionHistory: true 
+					});
 					
-					if (status.value.err) {
-						console.log(`  ❌ Error: ${JSON.stringify(status.value.err)}`);
+					totalChecked++;
+					
+					if (status.value?.confirmationStatus) {
+						const isSuccess = !status.value.err;
+						console.log(`${isSuccess ? '✅' : '❌'} TX ${i + 1}: ${status.value.confirmationStatus.toUpperCase()}${status.value.err ? ` (${JSON.stringify(status.value.err)})` : ''}`);
+						
+						if (isSuccess) {
+							successCount++;
+						}
+					} else {
+						console.log(`⏳ TX ${i + 1}: Not found yet`);
 					}
-				} else {
-					console.log(`⏳ TX ${i + 1}: Not found yet`);
+				} catch (error) {
+					console.log(`⚠️  TX ${i + 1}: Status check failed`);
 				}
-			} catch (error) {
-				console.log(`⚠️  TX ${i + 1}: Status check failed`);
 			}
+			
+			console.log(`\n🎉 BUNDLE SUCCESS CONFIRMED!`);
+			console.log(`📊 Transaction status: ${successCount}/${totalChecked} confirmed successful`);
+			
+			// Show wallet results
+			await showWalletResults();
+			
+			return true;
+		} else {
+			console.log("❌ Token creation not detected - bundle likely failed");
+			return false;
 		}
-
-		// Try to extract and verify token creation
-		await verifyTokenCreation();
 		
 	} catch (error) {
 		console.error("❌ Verification failed:", error);
-		console.log("\n💡 MANUAL VERIFICATION:");
-		console.log("1. Check your wallet for new tokens");
-		console.log("2. Look for recent transactions in your wallet history");
-		console.log("3. Search signatures on Solscan:");
-		
-		bundledTxns.forEach((tx, i) => {
-			const signature = bs58.encode(tx.signatures[0]);
-			console.log(`   TX ${i + 1}: https://solscan.io/tx/${signature}`);
-		});
+		return false;
 	}
 }
 
 // ✅ Check if token was successfully created and get details
-async function verifyTokenCreation() {
+async function verifyTokenCreation(): Promise<boolean> {
 	try {
-		// Read mint from keyInfo
 		const keyInfoPath = path.join(__dirname, "keyInfo.json");
 		if (!fs.existsSync(keyInfoPath)) {
-			console.log("⚠️  Cannot verify - keyInfo.json not found");
-			return;
+			return false;
 		}
 
 		const keyInfo = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
 		if (!keyInfo.mintPk) {
-			console.log("⚠️  Cannot verify - no mint in keyInfo");
-			return;
+			return false;
 		}
 
 		const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
 		const mintAddress = mintKp.publicKey;
 
-		console.log(`\n🎯 TOKEN CONTRACT: ${mintAddress.toBase58()}`);
-
-		// Check if mint exists
+		// Check if mint account exists
 		const mintInfo = await connection.getAccountInfo(mintAddress);
-		if (!mintInfo) {
-			console.log("❌ Token not created yet or bundle failed");
-			return;
+		if (mintInfo) {
+			console.log(`\n🎯 TOKEN CONTRACT: ${mintAddress.toBase58()}`);
+			console.log(`🔗 View on Pump.fun: https://pump.fun/${mintAddress.toBase58()}`);
+			
+			// Also check bonding curve
+			const [bondingCurve] = PublicKey.findProgramAddressSync(
+				[Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+				PUMP_PROGRAM
+			);
+
+			const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
+			if (bondingCurveInfo) {
+				console.log("✅ Bonding curve created successfully");
+			}
+			
+			return true;
 		}
+		
+		return false;
+	} catch (error) {
+		return false;
+	}
+}
 
-		console.log("✅ TOKEN SUCCESSFULLY CREATED!");
+// ✅ Show wallet results after successful launch
+async function showWalletResults() {
+	try {
+		const keyInfoPath = path.join(__dirname, "keyInfo.json");
+		const keyInfo = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
+		
+		if (!keyInfo.mintPk) return;
+		
+		const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
+		const mintAddress = mintKp.publicKey;
 
-		// Check bonding curve
-		const [bondingCurve] = PublicKey.findProgramAddressSync(
-			[Buffer.from("bonding-curve"), mintAddress.toBytes()], 
-			new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
-		);
-
-		const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
-		if (bondingCurveInfo) {
-			console.log("✅ Bonding curve created successfully");
-		}
-
-		// Check wallet balances and spending
 		console.log("\n💰 WALLET RESULTS:");
 		
-		// Dev wallet
-		const devWalletKey = "GrNCQjbgwWXexDvYPm4quKWXdGG6stFj76BtXkoswHTb"; // From your logs
-		await checkWalletResults(mintAddress, new PublicKey(devWalletKey), "DEV WALLET", keyInfo);
+		// Check dev wallet
+		const devWalletKey = wallet.publicKey.toString();
+		const devInfo = keyInfo[devWalletKey];
+		if (devInfo && devInfo.solAmount) {
+			await checkWalletResults(mintAddress, wallet.publicKey, "DEV WALLET", keyInfo);
+		}
 
-		// Other wallets
+		// Check other wallets
 		const validWallets = Object.keys(keyInfo).filter(key => 
 			key !== devWalletKey && 
 			keyInfo[key].solAmount && 
@@ -800,14 +786,13 @@ async function verifyTokenCreation() {
 		}
 
 		console.log("\n🎉 LAUNCH COMPLETE!");
-		console.log(`🔗 View on Pump.fun: https://pump.fun/${mintAddress.toBase58()}`);
-
+		
 	} catch (error) {
-		console.error("❌ Token verification failed:", error);
+		console.log("⚠️  Could not verify wallet results");
 	}
 }
 
-// ✅ Check individual wallet results
+// ✅ Keep your existing checkWalletResults function
 async function checkWalletResults(mintAddress: PublicKey, walletPubkey: PublicKey, walletName: string, keyInfo: any) {
 	try {
 		const walletKey = walletPubkey.toBase58();

@@ -279,7 +279,6 @@ async function createReturns() {
 	await sendBundle(txsSigned);
 }
 
-// Fixed simulation function - need to find this in your senderUI.ts
 async function simulateAndWriteBuys() {
 	const keypairs = loadKeypairs();
 
@@ -291,47 +290,68 @@ async function simulateAndWriteBuys() {
 	let totalTokensBought = 0;
 	const buys: { pubkey: PublicKey; solAmount: Number; tokenAmount: BN; percentSupply: number }[] = [];
 
+	console.log("\n🎯 BONDING CURVE SIMULATION");
+	console.log("============================");
+	console.log("This simulation accounts for slippage between purchases.");
+	console.log("Each buy affects the price for the next buy.\n");
+
 	for (let it = 0; it <= 24; it++) {
 		let keypair;
 		let solInput;
 		
 		if (it === 0) {
-			solInput = prompt(`Enter the amount of SOL for dev wallet: `);
+			solInput = prompt(`Enter SOL amount for DEV wallet (0 to skip): `);
 			keypair = wallet;
 		} else {
-			solInput = prompt(`Enter the amount of SOL for wallet ${it}: `);
+			solInput = prompt(`Enter SOL amount for wallet ${it} (0 or empty to skip): `);
 			keypair = keypairs[it - 1];
 		}
 
-		// ✅ CRITICAL FIX: Properly handle empty/invalid input
+		// ✅ FIX: Better input validation
 		const solInputNumber = parseFloat(solInput);
 		
 		// Skip if input is empty, invalid, or zero
 		if (!solInput || solInput.trim() === '' || isNaN(solInputNumber) || solInputNumber <= 0) {
-			console.log(`Invalid input for wallet ${it}, skipping.`);
-			continue; // ✅ ACTUALLY SKIP - don't add to buys array
+			console.log(`  ℹ️  Wallet ${it === 0 ? 'DEV' : it} skipped (no buy configured)\n`);
+			continue;
 		}
 
-		// Apply multiplier for dev wallet
-		const actualSolInput = it === 0 ? solInputNumber * 1.21 : solInputNumber;
+		// ✅ FIX: Remove the 1.21 multiplier that was causing issues
+		const actualSolInput = solInputNumber; // No multiplier
 		const solAmount = actualSolInput * LAMPORTS_PER_SOL;
 
-		// Calculate token amounts based on bonding curve
-		const e = new BN(solAmount);
-		const initialVirtualSolReserves = 30 * LAMPORTS_PER_SOL + initialRealSolReserves;
-		const a = new BN(initialVirtualSolReserves).mul(new BN(initialVirtualTokenReserves));
-		const i = new BN(initialVirtualSolReserves).add(e);
-		const l = a.div(i).add(new BN(1));
-		let tokensToBuy = new BN(initialVirtualTokenReserves).sub(l);
-		tokensToBuy = BN.min(tokensToBuy, new BN(initialRealTokenReserves));
-
+		// ✅ FIX: Updated bonding curve calculation with proper reserves
+		const solAmountBN = new BN(solAmount);
+		const currentVirtualSolReserves = 30 * LAMPORTS_PER_SOL + initialRealSolReserves;
+		
+		// Bonding curve: k = virtualSol * virtualTokens
+		const k = new BN(currentVirtualSolReserves).mul(new BN(initialVirtualTokenReserves));
+		const newVirtualSolReserves = new BN(currentVirtualSolReserves).add(solAmountBN);
+		const newVirtualTokenReserves = k.div(newVirtualSolReserves);
+		
+		let tokensToBuy = new BN(initialVirtualTokenReserves).sub(newVirtualTokenReserves);
+		
+		// ✅ FIX: Cap tokens to available real reserves
+		const maxTokensAvailable = new BN(initialRealTokenReserves);
+		tokensToBuy = BN.min(tokensToBuy, maxTokensAvailable);
+		
 		const tokensBought = tokensToBuy.toNumber();
 		const percentSupply = (tokensBought / tokenTotalSupply) * 100;
 
-		console.log(`Wallet ${it}: Bought ${tokensBought / tokenDecimals} tokens for ${e.toNumber() / LAMPORTS_PER_SOL} SOL`);
-		console.log(`Wallet ${it}: Owns ${percentSupply.toFixed(4)}% of total supply\n`);
+		// ✅ FIX: Better display formatting
+		console.log(`  💰 ${it === 0 ? 'DEV WALLET' : `WALLET ${it}`}:`);
+		console.log(`     Input: ${actualSolInput} SOL`);
+		console.log(`     Output: ${(tokensBought / tokenDecimals).toFixed(2)}M tokens`);
+		console.log(`     Supply: ${percentSupply.toFixed(4)}%`);
+		console.log(`     Price impact: ${((tokensBought / initialVirtualTokenReserves) * 100).toFixed(4)}%\n`);
 
-		// ✅ ONLY ADD TO BUYS ARRAY IF VALID INPUT
+		// ✅ CRITICAL: Check for dangerous price impact
+		if (tokensBought / initialVirtualTokenReserves > 0.1) { // More than 10% of virtual supply
+			console.log(`     ⚠️  WARNING: High price impact (${((tokensBought / initialVirtualTokenReserves) * 100).toFixed(2)}%)`);
+			console.log(`     This could cause slippage failures in actual transactions.\n`);
+		}
+
+		// Add to buys array
 		buys.push({ 
 			pubkey: keypair.publicKey, 
 			solAmount: Number(actualSolInput), 
@@ -339,63 +359,94 @@ async function simulateAndWriteBuys() {
 			percentSupply 
 		});
 
-		// Update reserves for next calculation
-		initialRealSolReserves += e.toNumber();
+		// ✅ FIX: Update reserves for next calculation (this is crucial!)
+		initialRealSolReserves += solAmountBN.toNumber();
 		initialRealTokenReserves -= tokensBought;
 		initialVirtualTokenReserves -= tokensBought;
 		totalTokensBought += tokensBought;
 	}
 
-	console.log("Final real sol reserves: ", initialRealSolReserves / LAMPORTS_PER_SOL);
-	console.log("Final real token reserves: ", initialRealTokenReserves / tokenDecimals);
-	console.log("Final virtual token reserves: ", initialVirtualTokenReserves / tokenDecimals);
-	console.log("Total tokens bought: ", totalTokensBought / tokenDecimals);
-	console.log("Total % of tokens bought: ", (totalTokensBought / tokenTotalSupply) * 100);
-	console.log(); // \n
+	// ✅ FIX: Better summary with slippage warnings
+	console.log("\n📊 SIMULATION SUMMARY");
+	console.log("====================");
+	console.log(`Final real SOL reserves: ${(initialRealSolReserves / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+	console.log(`Final real token reserves: ${(initialRealTokenReserves / tokenDecimals).toFixed(2)}M tokens`);
+	console.log(`Final virtual token reserves: ${(initialVirtualTokenReserves / tokenDecimals).toFixed(2)}M tokens`);
+	console.log(`Total tokens bought: ${(totalTokensBought / tokenDecimals).toFixed(2)}M tokens`);
+	console.log(`Total % of supply bought: ${((totalTokensBought / tokenTotalSupply) * 100).toFixed(4)}%`);
+	
+	// ✅ FIX: Slippage warning
+	const totalPriceImpact = (totalTokensBought / (1073000000 * tokenDecimals)) * 100;
+	if (totalPriceImpact > 15) {
+		console.log(`\n⚠️  HIGH SLIPPAGE WARNING!`);
+		console.log(`Total price impact: ${totalPriceImpact.toFixed(2)}%`);
+		console.log(`This could cause transaction failures. Consider:`);
+		console.log(`- Reducing buy amounts`);
+		console.log(`- Spacing out purchases over time`);
+		console.log(`- Using more forgiving slippage tolerances\n`);
+	}
 
 	const confirm = prompt("Do you want to use these buys? (yes/no): ").toLowerCase();
 	if (confirm === "yes") {
 		writeBuysToFile(buys);
 	} else {
 		console.log("Simulation aborted. Restarting...");
-		simulateAndWriteBuys(); // Restart the simulation
+		simulateAndWriteBuys();
 	}
 }
 
+// ✅ FIX: Better buy file writing with validation
 function writeBuysToFile(buys: Buy[]) {
-	// ✅ CRITICAL FIX: Start with empty object, not existing data
 	let buysObj: any = {};
 
-	// Only add wallets that actually have buy amounts
-	buys.forEach(buy => {
-		buysObj[buy.pubkey.toString()] = {
-			solAmount: buy.solAmount.toString(),
-			tokenAmount: buy.tokenAmount.toString(),
-			percentSupply: buy.percentSupply,
-		};
-	});
-
-	// ✅ IMPORTANT: Also preserve LUT and mint info if they exist
+	// Read existing data to preserve LUT and mint info
 	let existingData: any = {};
 	if (fs.existsSync(keyInfoPath)) {
 		existingData = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
 	}
 
-	// Preserve non-wallet data
+	// Preserve important non-wallet data
 	if (existingData.addressLUT) buysObj.addressLUT = existingData.addressLUT;
 	if (existingData.mint) buysObj.mint = existingData.mint;
 	if (existingData.mintPk) buysObj.mintPk = existingData.mintPk;
 	if (existingData.numOfWallets) buysObj.numOfWallets = existingData.numOfWallets;
 
-	// Write updated data to file
-	fs.writeFileSync(keyInfoPath, JSON.stringify(buysObj, null, 2), "utf8");
-	console.log("Buys have been successfully saved to keyinfo.json");
-	
-	// ✅ DEBUG: Show what was actually saved
-	console.log(`\n📊 SAVED BUY DATA FOR ${buys.length} WALLETS:`);
-	buys.forEach((buy, index) => {
-		console.log(`  ${index + 1}. ${buy.pubkey.toString().slice(0, 8)}... - ${buy.solAmount} SOL`);
+	// Add wallet buy data with validation
+	let validBuys = 0;
+	buys.forEach(buy => {
+		const solAmount = Number(buy.solAmount);
+		const tokenAmount = buy.tokenAmount.toString();
+		
+		// ✅ FIX: Validate data before saving
+		if (solAmount > 0 && tokenAmount !== "0") {
+			buysObj[buy.pubkey.toString()] = {
+				solAmount: solAmount.toString(),
+				tokenAmount: tokenAmount,
+				percentSupply: buy.percentSupply,
+			};
+			validBuys++;
+		}
 	});
+
+	// Write to file
+	fs.writeFileSync(keyInfoPath, JSON.stringify(buysObj, null, 2), "utf8");
+	
+	console.log(`\n✅ SUCCESS: Saved ${validBuys} valid wallet configurations`);
+	console.log(`📁 File: ${keyInfoPath}`);
+	
+	// ✅ DEBUG: Show what was saved
+	console.log(`\n📋 SAVED BUY DATA:`);
+	buys.forEach((buy, index) => {
+		const solAmount = Number(buy.solAmount);
+		if (solAmount > 0) {
+			const walletName = buy.pubkey.equals(wallet.publicKey) ? "DEV" : `W${index}`;
+			console.log(`  ${walletName}: ${solAmount} SOL → ${(buy.tokenAmount.toNumber() / 1e6).toFixed(2)}M tokens`);
+		}
+	});
+	
+	console.log(`\n💡 NEXT STEPS:`);
+	console.log(`1. Run "Send Simulation SOL Bundle" to fund wallets`);
+	console.log(`2. Then run "Create Pool Bundle" to launch`);
 }
 
 export async function sender() {
