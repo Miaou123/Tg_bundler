@@ -4,7 +4,7 @@ import { wallet, connection, payer } from "../config";
 import * as spl from "@solana/spl-token";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
-import promptSync from "prompt-sync";
+const promptSync = require("prompt-sync");
 import { createLUT, extendLUT } from "./createLUT";
 import fs from "fs";
 import path from "path";
@@ -279,6 +279,7 @@ async function createReturns() {
 	await sendBundle(txsSigned);
 }
 
+// Fixed simulation function - need to find this in your senderUI.ts
 async function simulateAndWriteBuys() {
 	const keypairs = loadKeypairs();
 
@@ -292,24 +293,30 @@ async function simulateAndWriteBuys() {
 
 	for (let it = 0; it <= 24; it++) {
 		let keypair;
-
 		let solInput;
+		
 		if (it === 0) {
 			solInput = prompt(`Enter the amount of SOL for dev wallet: `);
-			solInput = Number(solInput) * 1.21;
 			keypair = wallet;
 		} else {
-			solInput = +prompt(`Enter the amount of SOL for wallet ${it}: `);
+			solInput = prompt(`Enter the amount of SOL for wallet ${it}: `);
 			keypair = keypairs[it - 1];
 		}
 
-		const solAmount = solInput * LAMPORTS_PER_SOL;
-
-		if (isNaN(solAmount) || solAmount <= 0) {
+		// ✅ CRITICAL FIX: Properly handle empty/invalid input
+		const solInputNumber = parseFloat(solInput);
+		
+		// Skip if input is empty, invalid, or zero
+		if (!solInput || solInput.trim() === '' || isNaN(solInputNumber) || solInputNumber <= 0) {
 			console.log(`Invalid input for wallet ${it}, skipping.`);
-			continue;
+			continue; // ✅ ACTUALLY SKIP - don't add to buys array
 		}
 
+		// Apply multiplier for dev wallet
+		const actualSolInput = it === 0 ? solInputNumber * 1.21 : solInputNumber;
+		const solAmount = actualSolInput * LAMPORTS_PER_SOL;
+
+		// Calculate token amounts based on bonding curve
 		const e = new BN(solAmount);
 		const initialVirtualSolReserves = 30 * LAMPORTS_PER_SOL + initialRealSolReserves;
 		const a = new BN(initialVirtualSolReserves).mul(new BN(initialVirtualTokenReserves));
@@ -324,8 +331,15 @@ async function simulateAndWriteBuys() {
 		console.log(`Wallet ${it}: Bought ${tokensBought / tokenDecimals} tokens for ${e.toNumber() / LAMPORTS_PER_SOL} SOL`);
 		console.log(`Wallet ${it}: Owns ${percentSupply.toFixed(4)}% of total supply\n`);
 
-		buys.push({ pubkey: keypair.publicKey, solAmount: Number(solInput), tokenAmount: tokensToBuy, percentSupply });
+		// ✅ ONLY ADD TO BUYS ARRAY IF VALID INPUT
+		buys.push({ 
+			pubkey: keypair.publicKey, 
+			solAmount: Number(actualSolInput), 
+			tokenAmount: tokensToBuy, 
+			percentSupply 
+		});
 
+		// Update reserves for next calculation
 		initialRealSolReserves += e.toNumber();
 		initialRealTokenReserves -= tokensBought;
 		initialVirtualTokenReserves -= tokensBought;
@@ -349,25 +363,39 @@ async function simulateAndWriteBuys() {
 }
 
 function writeBuysToFile(buys: Buy[]) {
-	let existingData: any = {};
+	// ✅ CRITICAL FIX: Start with empty object, not existing data
+	let buysObj: any = {};
 
-	if (fs.existsSync(keyInfoPath)) {
-		existingData = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
-	}
-
-	// Convert buys array to an object keyed by public key
-	const buysObj = buys.reduce((acc, buy) => {
-		acc[buy.pubkey.toString()] = {
+	// Only add wallets that actually have buy amounts
+	buys.forEach(buy => {
+		buysObj[buy.pubkey.toString()] = {
 			solAmount: buy.solAmount.toString(),
 			tokenAmount: buy.tokenAmount.toString(),
 			percentSupply: buy.percentSupply,
 		};
-		return acc;
-	}, existingData); // Initialize with existing data
+	});
+
+	// ✅ IMPORTANT: Also preserve LUT and mint info if they exist
+	let existingData: any = {};
+	if (fs.existsSync(keyInfoPath)) {
+		existingData = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
+	}
+
+	// Preserve non-wallet data
+	if (existingData.addressLUT) buysObj.addressLUT = existingData.addressLUT;
+	if (existingData.mint) buysObj.mint = existingData.mint;
+	if (existingData.mintPk) buysObj.mintPk = existingData.mintPk;
+	if (existingData.numOfWallets) buysObj.numOfWallets = existingData.numOfWallets;
 
 	// Write updated data to file
 	fs.writeFileSync(keyInfoPath, JSON.stringify(buysObj, null, 2), "utf8");
 	console.log("Buys have been successfully saved to keyinfo.json");
+	
+	// ✅ DEBUG: Show what was actually saved
+	console.log(`\n📊 SAVED BUY DATA FOR ${buys.length} WALLETS:`);
+	buys.forEach((buy, index) => {
+		console.log(`  ${index + 1}. ${buy.pubkey.toString().slice(0, 8)}... - ${buy.solAmount} SOL`);
+	});
 }
 
 export async function sender() {

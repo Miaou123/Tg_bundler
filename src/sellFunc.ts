@@ -3,7 +3,7 @@ import { PublicKey, VersionedTransaction, SYSVAR_RENT_PUBKEY, TransactionMessage
 import { loadKeypairs } from "./createKeys";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
-import promptSync from "prompt-sync";
+const promptSync = require("prompt-sync");
 import * as spl from "@solana/spl-token";
 import bs58 from "bs58";
 import path from "path";

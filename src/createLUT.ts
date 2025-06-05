@@ -2,7 +2,7 @@ import { AddressLookupTableProgram, Keypair, PublicKey, VersionedTransaction, Tr
 import fs from 'fs';
 import path from 'path';
 import { wallet, connection, PUMP_PROGRAM, payer } from '../config';
-import promptSync from 'prompt-sync';
+const promptSync = require("prompt-sync");
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from 'jito-ts/dist/sdk/block-engine/types.js';
 import { getRandomTipAccount } from "./clients/config";

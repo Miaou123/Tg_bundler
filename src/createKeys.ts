@@ -1,6 +1,6 @@
 import { Keypair } from '@solana/web3.js';
 import * as fs from 'fs';
-import promptSync from 'prompt-sync';
+const promptSync = require("prompt-sync");
 import path from 'path';
 import bs58 from 'bs58';
 

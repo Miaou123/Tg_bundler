@@ -2,7 +2,7 @@ import { createKeypairs } from "./src/createKeys";
 import { buyBundle } from "./src/jitoPool";
 import { sender } from "./src/senderUI";
 import { sellXPercentagePF } from "./src/sellFunc";
-import promptSync from "prompt-sync";
+const promptSync = require("prompt-sync");
 import { sellXPercentageRAY } from "./src/sellRay";
 
 const prompt = promptSync();

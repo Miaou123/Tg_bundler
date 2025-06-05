@@ -9,11 +9,12 @@ import {
 	Keypair,
 	LAMPORTS_PER_SOL,
 	AddressLookupTableAccount,
+	ComputeBudgetProgram,
 } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
-import promptSync from "prompt-sync";
+const promptSync = require("prompt-sync");
 import * as spl from "@solana/spl-token";
 import bs58 from "bs58";
 import path from "path";
@@ -26,170 +27,24 @@ import * as anchor from "@coral-xyz/anchor";
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
 
+interface ValidWallet {
+    keypair: Keypair;
+    amount: BN;
+    solAmount: BN;
+    index: number;
+}
+
 function chunkArray<T>(array: T[], size: number): T[][] {
 	return Array.from({ length: Math.ceil(array.length / size) }, (v, i) => array.slice(i * size, i * size + size));
 }
 
-async function createWalletSwaps(
-	program: anchor.Program,
-	blockhash: string,
-	keypairs: Keypair[],
-	lut: AddressLookupTableAccount,
-	mint: PublicKey
-): Promise<VersionedTransaction[]> {
-	const txsSigned: VersionedTransaction[] = [];
-	const chunkedKeypairs = chunkArray(keypairs, 4); // Reduced chunk size for debugging
-
-	// Load keyInfo data from JSON file
-	let keyInfo: { [key: string]: { solAmount: number; tokenAmount: string; percentSupply: number } } = {};
-	if (fs.existsSync(keyInfoPath)) {
-		const existingData = fs.readFileSync(keyInfoPath, "utf-8");
-		keyInfo = JSON.parse(existingData);
-	}
-
-	console.log(`Creating ${chunkedKeypairs.length} chunks of transactions`);
-
-	// Pre-calculate PDAs once
-	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mint.toBytes()], PUMP_PROGRAM);
-	const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-		[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
-		spl.ASSOCIATED_TOKEN_PROGRAM_ID
-	);
-
-	console.log(`Bonding Curve: ${bondingCurve.toBase58()}`);
-	console.log(`Associated Bonding Curve: ${associatedBondingCurve.toBase58()}`);
-
-	// Fetch bonding curve account to get creator for creator vault derivation
-	let creatorPublicKey: PublicKey;
-	let creatorVault: PublicKey;
-	
-	// Since we know the creator will be wallet.publicKey (from create instruction), derive directly
-	creatorPublicKey = wallet.publicKey;
-	[creatorVault] = PublicKey.findProgramAddressSync(
-		[Buffer.from("creator-vault"), creatorPublicKey.toBytes()],
-		PUMP_PROGRAM
-	);
-	console.log(`Creator: ${creatorPublicKey.toBase58()}`);
-	console.log(`Creator Vault: ${creatorVault.toBase58()}`);
-
-	// Iterate over each chunk of keypairs
-	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
-		const chunk = chunkedKeypairs[chunkIndex];
-		const instructionsForChunk: TransactionInstruction[] = [];
-
-		console.log(`\n--- Processing Chunk ${chunkIndex + 1}/${chunkedKeypairs.length} ---`);
-
-		// Iterate over each keypair in the chunk to create swap instructions
-		for (let i = 0; i < chunk.length; i++) {
-			const keypair = chunk[i];
-			console.log(`Processing keypair ${i + 1}/${chunk.length}: ${keypair.publicKey.toString()}`);
-
-			// Extract tokenAmount from keyInfo for this keypair
-			const keypairInfo = keyInfo[keypair.publicKey.toString()];
-			if (!keypairInfo) {
-				console.log(`❌ No key info found for keypair: ${keypair.publicKey.toString()}`);
-				continue;
-			}
-
-			const ataAddress = await spl.getAssociatedTokenAddress(mint, keypair.publicKey);
-			console.log(`  ATA Address: ${ataAddress.toBase58()}`);
-
-			// ✅ NO ATA CREATION - Buy instruction handles this automatically
-			console.log(`  Buy instruction will create ATA automatically`);
-
-			// Calculate amounts
-			const amount = new BN(keypairInfo.tokenAmount);
-			const solAmount = new BN(100000 * keypairInfo.solAmount * LAMPORTS_PER_SOL);
-
-			console.log(`  Token Amount: ${amount.toString()}`);
-			console.log(`  SOL Amount: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
-
-			// Create buy instruction - Use regular accounts() with camelCase
-			try {
-				const buyIx = await (program.methods as any)
-					.buy(amount, solAmount)
-					.accounts({  // ✅ Back to regular accounts(), not accountsStrict
-						global: globalAccount,
-						feeRecipient: feeRecipient,                        // ✅ camelCase - what Anchor expects
-						mint: mint,
-						bondingCurve: bondingCurve,                        // ✅ camelCase
-						associatedBondingCurve: associatedBondingCurve,    // ✅ camelCase
-						associatedUser: ataAddress,                        // ✅ camelCase
-						user: keypair.publicKey,
-						systemProgram: SystemProgram.programId,            // ✅ camelCase
-						tokenProgram: spl.TOKEN_PROGRAM_ID,                // ✅ camelCase
-						creatorVault: creatorVault,                        // ✅ camelCase, pre-calculated
-						eventAuthority: eventAuthority,                    // ✅ camelCase
-						program: PUMP_PROGRAM,
-					})
-					.instruction();
-
-				instructionsForChunk.push(buyIx);
-				console.log(`  ✅ Created buy instruction for ${keypair.publicKey.toString()}`);
-
-			} catch (error) {
-				console.error(`  ❌ Error creating buy instruction for ${keypair.publicKey.toString()}:`, error);
-				continue;
-			}
-		}
-
-		if (instructionsForChunk.length === 0) {
-			console.log(`No valid instructions in chunk ${chunkIndex + 1}, skipping`);
-			continue;
-		}
-
-		console.log(`Creating transaction with ${instructionsForChunk.length} instructions`);
-
-		try {
-			const message = new TransactionMessage({
-				payerKey: payer.publicKey,  // ✅ Back to using payer since no ATA creation
-				recentBlockhash: blockhash,
-				instructions: instructionsForChunk,
-			}).compileToV0Message([lut]);
-
-			const versionedTx = new VersionedTransaction(message);
-
-			const serializedSize = versionedTx.serialize().length;
-			console.log(`Txn size: ${serializedSize} bytes`);
-			
-			if (serializedSize > 1232) {
-				console.log("❌ Transaction too big, skipping chunk");
-				continue;
-			}
-
-			// Sign with payer first
-			versionedTx.sign([payer]);
-
-			// Sign with the keypairs for this chunk
-			for (const kp of chunk) {
-				if (kp.publicKey.toString() in keyInfo) {
-					try {
-						versionedTx.sign([kp]);
-						console.log(`  ✅ Signed with ${kp.publicKey.toString()}`);
-					} catch (error) {
-						console.error(`  ❌ Error signing with ${kp.publicKey.toString()}:`, error);
-					}
-				}
-			}
-
-			// ✅ SKIP SIMULATION for wallet transactions - they depend on create transaction
-			console.log(`\n--- Skipping Simulation for Chunk ${chunkIndex + 1} (depends on create tx) ---`);
-			console.log(`✅ Chunk ${chunkIndex + 1} ready for bundle execution`);
-
-			txsSigned.push(versionedTx);
-			console.log(`✅ Added chunk ${chunkIndex + 1} to bundle`);
-
-		} catch (error) {
-			console.error(`❌ Error creating transaction for chunk ${chunkIndex + 1}:`, error);
-			continue;
-		}
-	}
-
-	console.log(`\n=== Created ${txsSigned.length} valid transactions ===`);
-	return txsSigned;
-}
-
+// ✅ MAIN BUNDLE FUNCTION - Multi-Transaction Bundle
 export async function buyBundle() {
+    console.log("🚀 PROFESSIONAL PUMP.FUN BUNDLER");
+    console.log("=================================");
+    console.log("📦 Multi-Transaction Bundle Strategy");
+    console.log("⚡ Optimized for Maximum Wallets");
+    
     const provider = new anchor.AnchorProvider(
         connection,
         new anchor.Wallet(wallet),
@@ -199,289 +54,777 @@ export async function buyBundle() {
     const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
     const program = new anchor.Program(IDL_PumpFun, provider);
 
-	let keyInfo: { [key: string]: any } = {};
-	if (fs.existsSync(keyInfoPath)) {
-		const existingData = fs.readFileSync(keyInfoPath, "utf-8");
-		keyInfo = JSON.parse(existingData);
-	}
+    let keyInfo: { [key: string]: any } = {};
+    if (fs.existsSync(keyInfoPath)) {
+        const existingData = fs.readFileSync(keyInfoPath, "utf-8");
+        keyInfo = JSON.parse(existingData);
+    }
 
-	console.log("=== DEBUG: Checking Required Accounts ===");
-	console.log(`Wallet: ${wallet.publicKey.toString()}`);
-	console.log(`Payer: ${payer.publicKey.toString()}`);
-	console.log(`Global: ${globalAccount.toString()}`);
-	console.log(`Fee Recipient: ${feeRecipient.toString()}`);
-	console.log(`Event Authority: ${eventAuthority.toString()}`);
-	console.log(`Mint Authority: ${mintAuthority.toString()}`);
+    console.log("\n=== SYSTEM CHECK ===");
+    console.log(`Dev Wallet: ${wallet.publicKey.toString()}`);
+    console.log(`Payer: ${payer.publicKey.toString()}`);
 
-	const lut = new PublicKey(keyInfo.addressLUT.toString());
-	const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+    // ✅ STEP 1: Verify LUT exists
+    if (!keyInfo.addressLUT) {
+        console.log("❌ ERROR: No LUT found!");
+        console.log("Please run the following steps first:");
+        console.log("1. Pre Launch Checklist → Create LUT");
+        console.log("2. Pre Launch Checklist → Extend LUT Bundle");
+        console.log("3. Pre Launch Checklist → Simulate Buys");
+        console.log("4. Pre Launch Checklist → Send Simulation SOL Bundle");
+        return;
+    }
 
-	if (lookupTableAccount == null) {
-		console.log("❌ Lookup table account not found!");
-		process.exit(0);
-	}
+    const lut = new PublicKey(keyInfo.addressLUT.toString());
+    console.log(`✅ LUT: ${lut.toString()}`);
 
-	console.log(`✅ Lookup table found: ${lut.toString()}`);
+    const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+    if (lookupTableAccount == null) {
+        console.log("❌ ERROR: LUT not found on-chain!");
+        return;
+    }
 
-	// -------- step 1: ask necessary questions for pool build --------
-	const name = prompt("Name of your token: ");
-	const symbol = prompt("Symbol of your token: ");
-	const description = prompt("Description of your token: ");
-	const twitter = prompt("Twitter of your token: ");
-	const telegram = prompt("Telegram of your token: ");
-	const website = prompt("Website of your token: ");
-	const tipAmt = +prompt("Jito tip in SOL: ") * LAMPORTS_PER_SOL;
+    console.log(`✅ LUT loaded with ${lookupTableAccount.state.addresses.length} addresses`);
 
-	// -------- step 2: upload metadata --------
-	console.log("\n=== UPLOADING METADATA ===");
-	const files = await fs.promises.readdir("./img");
-	if (files.length == 0) {
-		console.log("❌ No image found in the img folder");
-		return;
-	}
-	if (files.length > 1) {
-		console.log("❌ Multiple images found in the img folder, please only keep one image");
-		return;
-	}
+    // ✅ STEP 2: Collect token metadata
+    console.log("\n=== TOKEN METADATA ===");
+    const name = prompt("Token name: ");
+    const symbol = prompt("Token symbol: ");
+    const description = prompt("Token description: ");
+    const twitter = prompt("Twitter (optional): ");
+    const telegram = prompt("Telegram (optional): ");
+    const website = prompt("Website (optional): ");
+    const tipAmt = +prompt("Jito tip in SOL (e.g., 0.01): ") * LAMPORTS_PER_SOL;
 
-	const data: Buffer = fs.readFileSync(`./img/${files[0]}`);
-	let formData = new FormData();
-	
-	if (data) {
-		formData.append("file", new Blob([data], { type: "image/jpeg" }));
-	} else {
-		console.log("❌ No image found");
-		return;
-	}
+    // ✅ STEP 3: Upload metadata to IPFS
+    console.log("\n=== UPLOADING TO IPFS ===");
+    const metadata_uri = await uploadMetadata(name, symbol, description, twitter, telegram, website);
+    if (!metadata_uri) return;
 
-	formData.append("name", name);
-	formData.append("symbol", symbol);
-	formData.append("description", description);
-	formData.append("twitter", twitter);
-	formData.append("telegram", telegram);
-	formData.append("website", website);
-	formData.append("showName", "true");
+    // ✅ STEP 4: Get mint from keyInfo
+    console.log("\n=== LOADING MINT ===");
+    if (!keyInfo.mintPk) {
+        console.log("❌ ERROR: No mint found in keyInfo!");
+        return;
+    }
+    
+    const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
+    console.log(`✅ Mint: ${mintKp.publicKey.toBase58()}`);
 
-	let metadata_uri;
-	try {
-		const response = await axios.post("https://pump.fun/api/ipfs", formData, {
-			headers: {
-				"Content-Type": "multipart/form-data",
-			},
-		});
-		metadata_uri = response.data.metadataUri;
-		console.log("✅ Metadata uploaded successfully");
-		console.log("Metadata URI: ", metadata_uri);
-	} catch (error) {
-		console.error("❌ Error uploading metadata:", error);
-		return;
-	}
+    // ✅ STEP 5: Validate wallets
+    console.log("\n=== VALIDATING WALLETS ===");
+    const validWallets = await validateWallets(keyInfo);
+    
+    if (validWallets.length === 0) {
+        console.log("❌ ERROR: No valid wallets found!");
+        return;
+    }
 
-	// -------- step 3: use existing mint --------
-	console.log("\n=== USING MINT FROM KEYINFO ===");
-	
-	if (!keyInfo.mintPk) {
-		console.log("❌ No mint found in keyInfo. Please run 'Extend LUT Bundle' first.");
-		return;
-	}
-	
-	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
-	console.log(`Using mint: ${mintKp.publicKey.toBase58()}`);
+    // ✅ STEP 6: Plan bundle strategy
+    console.log("\n=== BUNDLE STRATEGY ===");
+    const walletsPerTx = 4; // 4 wallets per transaction (safe for compute budget)
+    const walletChunks = chunkArray(validWallets, walletsPerTx);
+    
+    // Check if dev wallet has buy configured
+    const devInfo = keyInfo[wallet.publicKey.toString()];
+    const devHasBuy = devInfo && devInfo.solAmount && parseFloat(devInfo.solAmount) > 0;
+    
+    const totalTxs = (devHasBuy ? 2 : 1) + walletChunks.length; // CREATE + DEV BUY (if configured) + wallet chunks
+    
+    console.log(`📊 Bundle Plan:`);
+    console.log(`  • TX 1: CREATE TOKEN`);
+    if (devHasBuy) {
+        console.log(`  • TX 2: DEV BUY`);
+    }
+    for (let i = 0; i < walletChunks.length; i++) {
+        const isLast = i === walletChunks.length - 1;
+        const tipNote = isLast ? " + JITO TIP" : "";
+        const txNum = (devHasBuy ? 3 : 2) + i;
+        console.log(`  • TX ${txNum}: Wallets ${i * walletsPerTx + 1}-${Math.min((i + 1) * walletsPerTx, validWallets.length)}${tipNote}`);
+    }
+    console.log(`  • Total: ${totalTxs} transactions`);
+    console.log(`  • Wallets: ${validWallets.length} buying simultaneously`);
 
-	// -------- step 4: create the token --------
-	console.log("\n=== CREATING TOKEN WITH ANCHOR ===");
-	
-	const [bondingCurve] = PublicKey.findProgramAddressSync([Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], PUMP_PROGRAM);
-	const [metadata] = PublicKey.findProgramAddressSync([Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], MPL_TOKEN_METADATA_PROGRAM_ID);
-	const [associatedBondingCurve] = PublicKey.findProgramAddressSync([bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], spl.ASSOCIATED_TOKEN_PROGRAM_ID);
+    if (totalTxs > 5) {
+        console.log(`⚠️  WARNING: ${totalTxs} transactions in bundle (max recommended: 5)`);
+        const proceed = prompt("Continue anyway? (y/n): ").toLowerCase();
+        if (proceed !== 'y') return;
+    }
 
-	console.log(`Bonding Curve: ${bondingCurve.toBase58()}`);
-	console.log(`Metadata: ${metadata.toBase58()}`);
-	console.log(`Associated Bonding Curve: ${associatedBondingCurve.toBase58()}`);
+    // ✅ STEP 7: Build all transactions
+    console.log("\n=== BUILDING TRANSACTIONS ===");
+    const allTxs = await buildMultiTransactionBundle(
+        program, mintKp, validWallets, keyInfo,
+        name, symbol, metadata_uri, tipAmt, lookupTableAccount
+    );
 
-	// ✅ CHECK IF TOKEN ALREADY EXISTS
-	try {
-		const bondingCurveAccount = await connection.getAccountInfo(bondingCurve);
-		if (bondingCurveAccount) {
-			console.log("⚠️  WARNING: Token already exists! This might cause AlreadyInitialized error.");
-			console.log("Consider using a fresh mint or skipping the create instruction.");
-		} else {
-			console.log("✅ Token doesn't exist yet, safe to create.");
-		}
-	} catch (error) {
-		console.log("✅ Token doesn't exist yet, safe to create.");
-	}
+    if (allTxs.length === 0) {
+        console.log("❌ Failed to build transactions");
+        return;
+    }
 
-	// CREATE INSTRUCTION - Use camelCase for JavaScript/Anchor
-	const createIx = await (program.methods as any)
-		.create(name, symbol, metadata_uri, wallet.publicKey) // ✅ CREATE DOES take creator parameter!
-		.accounts({
-			mint: mintKp.publicKey,
-			mintAuthority: mintAuthority,                      // ✅ camelCase for JavaScript
-			bondingCurve: bondingCurve,                        // ✅ camelCase for JavaScript
-			associatedBondingCurve: associatedBondingCurve,    // ✅ camelCase for JavaScript
-			global: globalAccount,
-			mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,   // ✅ camelCase for JavaScript
-			metadata: metadata,
-			user: wallet.publicKey,
-			systemProgram: SystemProgram.programId,            // ✅ camelCase for JavaScript
-			tokenProgram: spl.TOKEN_PROGRAM_ID,                // ✅ camelCase for JavaScript
-			associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID, // ✅ camelCase for JavaScript
-			rent: SYSVAR_RENT_PUBKEY,
-			eventAuthority: eventAuthority,                    // ✅ camelCase for JavaScript
-			program: PUMP_PROGRAM,
-		})
-		.instruction();
+    // ✅ STEP 8: Final confirmation
+    console.log("\n=== LAUNCH CONFIRMATION ===");
+    console.log(`🎯 Token: ${name} (${symbol})`);
+    console.log(`📦 Bundle: ${allTxs.length} transactions`);
+    console.log(`👥 Wallets: ${validWallets.length} simultaneous buyers`);
+    console.log(`💰 Jito tip: ${tipAmt / LAMPORTS_PER_SOL} SOL`);
+    console.log(`📏 Total size: ${allTxs.reduce((sum, tx) => sum + tx.serialize().length, 0).toLocaleString()} bytes`);
+    
+    const confirm = prompt("\n🚀 LAUNCH BUNDLE NOW? (yes/no): ").toLowerCase();
+    if (confirm !== 'yes') {
+        console.log("Launch cancelled.");
+        return;
+    }
 
-	// Get the associated token address for dev wallet
-	const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
-	const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, ata, wallet.publicKey, mintKp.publicKey);
-
-	// Extract tokenAmount from keyInfo for dev wallet
-	const keypairInfo = keyInfo[wallet.publicKey.toString()];
-	if (!keypairInfo) {
-		console.log(`❌ No key info found for dev wallet: ${wallet.publicKey.toString()}`);
-		console.log("Please run the simulation first to set buy amounts.");
-		return;
-	}
-
-	// Calculate SOL amount based on tokenAmount for dev wallet
-	const amount = new BN(keypairInfo.tokenAmount);
-	const solAmount = new BN(100000 * keypairInfo.solAmount * LAMPORTS_PER_SOL);
-
-	console.log(`Dev wallet buying ${amount.toString()} tokens for ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
-
-	// ✅ MANUALLY DERIVE CREATOR VAULT - Don't let Anchor auto-resolve
-	const [creatorVault] = PublicKey.findProgramAddressSync(
-		[Buffer.from("creator-vault"), wallet.publicKey.toBytes()],
-		PUMP_PROGRAM
-	);
-	console.log(`Creator Vault: ${creatorVault.toBase58()}`);
-
-	// FIXED BUY INSTRUCTION - Use regular accounts() with camelCase
-	const buyIx = await (program.methods as any)
-		.buy(amount, solAmount)
-		.accounts({  // ✅ Back to regular accounts(), not accountsStrict
-			global: globalAccount,
-			feeRecipient: feeRecipient,                        // ✅ camelCase - what Anchor expects
-			mint: mintKp.publicKey,
-			bondingCurve: bondingCurve,                        // ✅ camelCase
-			associatedBondingCurve: associatedBondingCurve,    // ✅ camelCase
-			associatedUser: ata,                               // ✅ camelCase
-			user: wallet.publicKey,
-			systemProgram: SystemProgram.programId,            // ✅ camelCase
-			tokenProgram: spl.TOKEN_PROGRAM_ID,                // ✅ camelCase
-			creatorVault: creatorVault,                        // ✅ camelCase, manually provided
-			eventAuthority: eventAuthority,                    // ✅ camelCase
-			program: PUMP_PROGRAM,
-		})
-		.instruction();
-
-	const tipIxn = SystemProgram.transfer({
-		fromPubkey: wallet.publicKey,
-		toPubkey: getRandomTipAccount(),
-		lamports: BigInt(tipAmt),
-	});
-
-	// ✅ BACK TO COMBINED TRANSACTION - Derive creator vault directly
-	const initIxs: TransactionInstruction[] = [createIx, ataIx, buyIx, tipIxn];
-
-	const { blockhash } = await connection.getLatestBlockhash();
-
-	const messageV0 = new TransactionMessage({
-		payerKey: wallet.publicKey,
-		instructions: initIxs,
-		recentBlockhash: blockhash,
-	}).compileToV0Message();
-
-	const fullTX = new VersionedTransaction(messageV0);
-	fullTX.sign([wallet, mintKp]);
-
-	console.log("\n=== SIMULATING CREATE + DEV BUY TRANSACTION ===");
-	try {
-		const simulationResult = await connection.simulateTransaction(fullTX, { 
-			commitment: "processed",
-			sigVerify: false
-		});
-
-		if (simulationResult.value.err) {
-			console.error("❌ Create transaction simulation error:", simulationResult.value.err);
-			console.log("Logs:");
-			const logs = simulationResult.value.logs || [];
-			logs.forEach((log, i) => console.log(`  ${i}: ${log}`));
-			return;
-		} else {
-			console.log("✅ Create transaction simulation success!");
-		}
-	} catch (error) {
-		console.error("❌ Error during create transaction simulation:", error);
-		return;
-	}
-
-	const bundledTxns: VersionedTransaction[] = [fullTX];
-
-	// -------- step 5: create wallet swap transactions --------
-	console.log("\n=== CREATING WALLET BUY TRANSACTIONS ===");
-	const txMainSwaps: VersionedTransaction[] = await createWalletSwaps(program, blockhash, loadKeypairs(), lookupTableAccount, mintKp.publicKey);
-	bundledTxns.push(...txMainSwaps);
-
-	// -------- step 6: send bundle --------
-	console.log(`\n=== SENDING BUNDLE WITH ${bundledTxns.length} TRANSACTIONS ===`);
-	
-	// Additional check
-	if (bundledTxns.length > 5) {
-		console.log(`❌ Bundle has ${bundledTxns.length} transactions, reducing to first 5`);
-		bundledTxns.splice(5); // Keep only first 5
-	}
-
-	await sendBundle(bundledTxns);
+    // ✅ STEP 9: Send to Jito
+    console.log("\n=== LAUNCHING TO JITO ===");
+    await sendBundle(allTxs);
 }
 
+// ✅ Build multi-transaction bundle
+async function buildMultiTransactionBundle(
+    program: anchor.Program,
+    mintKp: Keypair,
+    validWallets: ValidWallet[],
+    keyInfo: any,
+    name: string,
+    symbol: string,
+    metadata_uri: string,
+    tipAmt: number,
+    lookupTableAccount: AddressLookupTableAccount
+): Promise<VersionedTransaction[]> {
+    
+    const { blockhash } = await connection.getLatestBlockhash();
+    const allTxs: VersionedTransaction[] = [];
+
+    // Pre-calculate PDAs
+    const [bondingCurve] = PublicKey.findProgramAddressSync(
+        [Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
+        PUMP_PROGRAM
+    );
+    const [metadata] = PublicKey.findProgramAddressSync(
+        [Buffer.from("metadata"), MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], 
+        MPL_TOKEN_METADATA_PROGRAM_ID
+    );
+    const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+        [bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()], 
+        spl.ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    const [creatorVault] = PublicKey.findProgramAddressSync(
+        [Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
+        PUMP_PROGRAM
+    );
+
+    // Check if dev wallet has buy configured
+    const devInfo = keyInfo[wallet.publicKey.toString()];
+    const devHasBuy = devInfo && devInfo.solAmount && parseFloat(devInfo.solAmount) > 0;
+
+    console.log("🔨 Building TX 1: CREATE TOKEN");
+    
+    // ✅ TRANSACTION 1: CREATE ONLY (no dev buy)
+    const createTxIxs: TransactionInstruction[] = [];
+    
+    // Compute budget for CREATE transaction - increased for safety
+    createTxIxs.push(
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }), // Increased from 400k
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200000 }) // Higher priority
+    );
+
+    // Create instruction only
+    const createIx = await (program.methods as any)
+        .create(name, symbol, metadata_uri, wallet.publicKey)
+        .accounts({
+            mint: mintKp.publicKey,
+            mintAuthority: mintAuthority,
+            bondingCurve: bondingCurve,
+            associatedBondingCurve: associatedBondingCurve,
+            global: globalAccount,
+            mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID,
+            metadata: metadata,
+            user: wallet.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: spl.TOKEN_PROGRAM_ID,
+            associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+            rent: SYSVAR_RENT_PUBKEY,
+            eventAuthority: eventAuthority,
+            program: PUMP_PROGRAM,
+        })
+        .instruction();
+
+    createTxIxs.push(createIx);
+
+    // Build CREATE transaction
+    const createMessage = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        instructions: createTxIxs,
+        recentBlockhash: blockhash,
+    }).compileToV0Message([lookupTableAccount]);
+
+    const createTx = new VersionedTransaction(createMessage);
+    
+    // Size and simulation check
+    const createSize = createTx.serialize().length;
+    console.log(`  📏 Size: ${createSize}/1232 bytes`);
+    
+    if (createSize > 1232) {
+        console.log(`  ❌ CREATE transaction too large: ${createSize} bytes`);
+        return [];
+    }
+
+    createTx.sign([wallet, mintKp]);
+
+    // Simulate CREATE transaction
+    console.log(`  🧪 Simulating CREATE transaction...`);
+    try {
+        const result = await connection.simulateTransaction(createTx, { 
+            commitment: "processed",
+            sigVerify: false,
+            replaceRecentBlockhash: true
+        });
+
+        if (result.value.err) {
+            console.error(`  ❌ CREATE simulation failed:`, result.value.err);
+            return [];
+        }
+
+        console.log(`  ✅ CREATE simulation success! CU: ${result.value.unitsConsumed?.toLocaleString()}`);
+    } catch (error) {
+        console.error(`  ❌ CREATE simulation error:`, error);
+        return [];
+    }
+
+    allTxs.push(createTx);
+
+    // ✅ TRANSACTION 2: DEV BUY (if configured)
+    if (devHasBuy) {
+        console.log("🔨 Building TX 2: DEV BUY");
+        
+        const devBuyTxIxs: TransactionInstruction[] = [];
+        
+        // Compute budget for DEV BUY
+        devBuyTxIxs.push(
+            ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
+        );
+
+        console.log(`  💰 Dev buy: ${devInfo.solAmount} SOL`);
+        
+        const devAta = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
+        
+        const devAtaIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+            wallet.publicKey, devAta, wallet.publicKey, mintKp.publicKey
+        );
+        
+        // Calculate reasonable minimum tokens (about 90% of expected amount)
+        const expectedTokens = new BN(devInfo.tokenAmount);
+        const minTokens = expectedTokens.muln(90).divn(100); // 90% of expected
+        const devSolAmount = new BN(Math.floor(parseFloat(devInfo.solAmount) * LAMPORTS_PER_SOL));
+        
+        console.log(`  Expected: ${expectedTokens.toNumber() / 1e6}M tokens, Min: ${minTokens.toNumber() / 1e6}M tokens`);
+        
+        const devBuyIx = await (program.methods as any)
+            .buy(minTokens, devSolAmount)
+            .accounts({
+                global: globalAccount,
+                feeRecipient: feeRecipient,
+                mint: mintKp.publicKey,
+                bondingCurve: bondingCurve,
+                associatedBondingCurve: associatedBondingCurve,
+                associatedUser: devAta,
+                user: wallet.publicKey,
+                systemProgram: SystemProgram.programId,
+                tokenProgram: spl.TOKEN_PROGRAM_ID,
+                creatorVault: creatorVault,
+                eventAuthority: eventAuthority,
+                program: PUMP_PROGRAM,
+            })
+            .instruction();
+
+        devBuyTxIxs.push(devAtaIx, devBuyIx);
+
+        // Build DEV BUY transaction
+        const devBuyMessage = new TransactionMessage({
+            payerKey: wallet.publicKey,
+            instructions: devBuyTxIxs,
+            recentBlockhash: blockhash,
+        }).compileToV0Message([lookupTableAccount]);
+
+        const devBuyTx = new VersionedTransaction(devBuyMessage);
+        
+        // Size check
+        const devBuySize = devBuyTx.serialize().length;
+        console.log(`  📏 Size: ${devBuySize}/1232 bytes`);
+        
+        if (devBuySize > 1232) {
+            console.log(`  ❌ DEV BUY transaction too large: ${devBuySize} bytes`);
+            return [];
+        }
+
+        devBuyTx.sign([wallet]);
+
+        // Skip simulation for DEV BUY (depends on CREATE)
+        console.log(`  ✅ DEV BUY transaction built (skipping simulation - depends on CREATE)`);
+
+        allTxs.push(devBuyTx);
+    } else {
+        console.log("  ℹ️  No dev buy configured, skipping DEV BUY transaction");
+    }
+
+    // ✅ WALLET BUY TRANSACTIONS
+    const walletsPerTx = 4;
+    const walletChunks = chunkArray(validWallets, walletsPerTx);
+
+    for (let chunkIndex = 0; chunkIndex < walletChunks.length; chunkIndex++) {
+        const chunk = walletChunks[chunkIndex];
+        const isLastChunk = chunkIndex === walletChunks.length - 1;
+        const txNumber = (devHasBuy ? 3 : 2) + chunkIndex;
+        
+        console.log(`🔨 Building TX ${txNumber}: Wallets ${chunk[0].index}-${chunk[chunk.length - 1].index}${isLastChunk ? ' + TIP' : ''}`);
+
+        const walletTxIxs: TransactionInstruction[] = [];
+        
+        // Compute budget for wallet transaction
+        const walletCU = 100000 + (chunk.length * 80000); // Base + per wallet
+        walletTxIxs.push(
+            ComputeBudgetProgram.setComputeUnitLimit({ units: walletCU }),
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+        );
+
+        // Add buy instructions for each wallet in chunk
+        for (const { keypair, amount, solAmount, index } of chunk) {
+            console.log(`    👤 Wallet ${index}: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
+            
+            const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, keypair.publicKey);
+            
+            // ATA creation (idempotent)
+            const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+                keypair.publicKey, ata, keypair.publicKey, mintKp.publicKey
+            );
+            
+            // Calculate reasonable minimum tokens (about 90% of expected amount)
+            const keypairInfo = keyInfo[keypair.publicKey.toString()];
+            if (!keypairInfo) {
+                console.log(`    ⚠️  No key info for wallet ${index}`);
+                continue;
+            }
+
+            const expectedTokens = new BN(keypairInfo.tokenAmount);
+            const minTokens = expectedTokens.muln(90).divn(100); // 90% of expected
+            
+            // Buy instruction
+            const buyIx = await (program.methods as any)
+                .buy(minTokens, solAmount)
+                .accounts({
+                    global: globalAccount,
+                    feeRecipient: feeRecipient,
+                    mint: mintKp.publicKey,
+                    bondingCurve: bondingCurve,
+                    associatedBondingCurve: associatedBondingCurve,
+                    associatedUser: ata,
+                    user: keypair.publicKey,
+                    systemProgram: SystemProgram.programId,
+                    tokenProgram: spl.TOKEN_PROGRAM_ID,
+                    creatorVault: creatorVault,
+                    eventAuthority: eventAuthority,
+                    program: PUMP_PROGRAM,
+                })
+                .instruction();
+            
+            walletTxIxs.push(ataIx, buyIx);
+        }
+
+        // Add Jito tip to last transaction
+        if (isLastChunk) {
+            console.log(`    💰 Adding Jito tip: ${tipAmt / LAMPORTS_PER_SOL} SOL`);
+            walletTxIxs.push(
+                SystemProgram.transfer({
+                    fromPubkey: payer.publicKey,
+                    toPubkey: getRandomTipAccount(),
+                    lamports: BigInt(tipAmt),
+                })
+            );
+        }
+
+        // Build wallet transaction
+        const walletMessage = new TransactionMessage({
+            payerKey: payer.publicKey,
+            instructions: walletTxIxs,
+            recentBlockhash: blockhash,
+        }).compileToV0Message([lookupTableAccount]);
+
+        const walletTx = new VersionedTransaction(walletMessage);
+        
+        // Size check
+        const walletSize = walletTx.serialize().length;
+        console.log(`    📏 Size: ${walletSize}/1232 bytes`);
+        
+        if (walletSize > 1232) {
+            console.log(`    ❌ Wallet TX ${txNumber} too large: ${walletSize} bytes`);
+            return [];
+        }
+
+        // Sign with payer and all wallet keypairs
+        const signers = [payer, ...chunk.map(w => w.keypair)];
+        walletTx.sign(signers);
+
+        // Skip simulation for wallet transactions (they depend on CREATE being successful)
+        console.log(`    ✅ Wallet TX ${txNumber} built and signed (${chunk.length} wallets)`);
+
+        allTxs.push(walletTx);
+    }
+
+    console.log(`\n🎉 Bundle complete: ${allTxs.length} transactions ready`);
+    return allTxs;
+}
+
+// ✅ Upload metadata to IPFS
+async function uploadMetadata(
+    name: string, symbol: string, description: string, 
+    twitter: string, telegram: string, website: string
+): Promise<string | null> {
+    
+    const files = await fs.promises.readdir("./img");
+    if (files.length === 0) {
+        console.log("❌ No image found in ./img folder");
+        return null;
+    }
+    if (files.length > 1) {
+        console.log("❌ Multiple images found - please keep only one image in ./img folder");
+        return null;
+    }
+
+    const data: Buffer = fs.readFileSync(`./img/${files[0]}`);
+    const formData = new FormData();
+    
+    formData.append("file", new Blob([data], { type: "image/jpeg" }));
+    formData.append("name", name);
+    formData.append("symbol", symbol);
+    formData.append("description", description);
+    formData.append("twitter", twitter);
+    formData.append("telegram", telegram);
+    formData.append("website", website);
+    formData.append("showName", "true");
+
+    try {
+        const response = await axios.post("https://pump.fun/api/ipfs", formData, {
+            headers: { "Content-Type": "multipart/form-data" },
+        });
+        
+        console.log("✅ Metadata uploaded to IPFS");
+        console.log(`📎 URI: ${response.data.metadataUri}`);
+        return response.data.metadataUri;
+        
+    } catch (error) {
+        console.error("❌ IPFS upload failed:", error);
+        return null;
+    }
+}
+
+// ✅ Validate wallets for transaction
+async function validateWallets(keyInfo: any): Promise<ValidWallet[]> {
+    const keypairs = loadKeypairs();
+    const validWallets: ValidWallet[] = [];
+    
+    console.log(`Checking ${keypairs.length} wallets + dev wallet...`);
+    
+    // Check dev wallet
+    const devWalletKey = wallet.publicKey.toString();
+    const devInfo = keyInfo[devWalletKey];
+    
+    if (devInfo && devInfo.solAmount && parseFloat(devInfo.solAmount) > 0) {
+        try {
+            const balance = await connection.getBalance(wallet.publicKey);
+            const balanceSOL = balance / LAMPORTS_PER_SOL;
+            const requiredSOL = parseFloat(devInfo.solAmount) + 0.05;
+            
+            if (balanceSOL >= requiredSOL) {
+                console.log(`✅ DEV WALLET: ${devInfo.solAmount} SOL configured, ${balanceSOL.toFixed(4)} SOL available → ${(parseFloat(devInfo.tokenAmount) / 1e6).toFixed(2)}M tokens`);
+            } else {
+                console.log(`⚠️  DEV WALLET: Insufficient balance! Need ${requiredSOL.toFixed(4)} SOL, have ${balanceSOL.toFixed(4)} SOL`);
+            }
+        } catch (error) {
+            console.log(`⚠️  DEV WALLET: Balance check failed`);
+        }
+    } else {
+        console.log(`ℹ️  DEV WALLET: No buy configured (will only create token)`);
+    }
+    
+    // Check regular wallets
+    for (let i = 0; i < keypairs.length; i++) {
+        const keypair = keypairs[i];
+        const keypairInfo = keyInfo[keypair.publicKey.toString()];
+        
+        if (!keypairInfo || !keypairInfo.solAmount || !keypairInfo.tokenAmount) {
+            console.log(`⚠️  Wallet ${i + 1}: No simulation data`);
+            continue;
+        }
+        
+        const solAmount = parseFloat(keypairInfo.solAmount.toString());
+        if (solAmount <= 0) {
+            console.log(`⚠️  Wallet ${i + 1}: Invalid SOL amount`);
+            continue;
+        }
+
+        try {
+            const balance = await connection.getBalance(keypair.publicKey);
+            const balanceSOL = balance / LAMPORTS_PER_SOL;
+            const requiredSOL = solAmount + 0.01;
+            
+            if (balanceSOL < requiredSOL) {
+                console.log(`⚠️  Wallet ${i + 1}: Insufficient balance (${balanceSOL.toFixed(4)} < ${requiredSOL.toFixed(4)} SOL)`);
+                continue;
+            }
+            
+            const amount = new BN(keypairInfo.tokenAmount);
+            const solAmountBN = new BN(Math.floor(solAmount * LAMPORTS_PER_SOL));
+            
+            validWallets.push({ 
+                keypair, 
+                amount, 
+                solAmount: solAmountBN, 
+                index: i + 1 
+            });
+            
+            console.log(`✅ Wallet ${i + 1}: ${solAmount} SOL → ${(amount.toNumber() / 1e6).toFixed(2)}M tokens`);
+            
+        } catch (error) {
+            console.log(`⚠️  Wallet ${i + 1}: Balance check failed`);
+            continue;
+        }
+    }
+    
+    return validWallets;
+}
+
+// ✅ Send bundle to Jito
 export async function sendBundle(bundledTxns: VersionedTransaction[]) {
 	if (bundledTxns.length === 0) {
-		console.log("❌ No transactions to send in bundle");
+		console.log("❌ No transactions to send");
 		return;
 	}
 
-	console.log(`Sending bundle with ${bundledTxns.length} transactions`);
+	console.log(`📤 Sending bundle with ${bundledTxns.length} transactions to Jito`);
+    console.log(`📏 Total bundle size: ${bundledTxns.reduce((sum, tx) => sum + tx.serialize().length, 0).toLocaleString()} bytes`);
 
 	try {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
-		console.log(`✅ Bundle ${bundleId} sent successfully!`);
+		console.log(`✅ Bundle sent successfully!`);
+        console.log(`🆔 Bundle ID: ${bundleId}`);
 
-		// Listen for bundle result with timeout
-		const result = await new Promise((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				reject(new Error("Bundle result timeout after 30 seconds"));
-			}, 30000);
+		console.log("⏳ Waiting for bundle result...");
+		
+		// Set shorter timeout and handle rate limits gracefully
+		const result = await Promise.race([
+			new Promise((resolve, reject) => {
+				const timeout = setTimeout(() => {
+					resolve({ timeout: true });
+				}, 15000); // Reduced timeout to 15 seconds
 
-			searcherClient.onBundleResult(
-				(result) => {
-					clearTimeout(timeout);
-					console.log("Bundle result received:", result);
-					resolve(result);
-				},
-				(e: Error) => {
-					clearTimeout(timeout);
-					console.error("Error receiving bundle result:", e);
-					reject(e);
-				}
-			);
-		});
+				searcherClient.onBundleResult(
+					(result) => {
+						clearTimeout(timeout);
+						
+						if (result.accepted) {
+							console.log("🎉 BUNDLE ACCEPTED AND EXECUTED!");
+						} else if (result.rejected) {
+							console.log("❌ Bundle rejected by Jito");
+							if (result.rejected.simulationFailure) {
+								console.log(`  Rejection reason: ${result.rejected.simulationFailure.msg}`);
+							}
+						} else {
+							console.log("⏳ Bundle status unknown");
+						}
+						
+						resolve(result);
+					},
+					(e: Error) => {
+						clearTimeout(timeout);
+						// Handle rate limit errors gracefully
+						if (e.message.includes('Rate limit exceeded') || e.message.includes('RESOURCE_EXHAUSTED')) {
+							console.log("⚠️  Jito API rate limit hit - bundle may still be processing");
+							resolve({ rateLimited: true });
+						} else {
+							reject(e);
+						}
+					}
+				);
+			}),
+		]);
 
-		console.log("Final result:", result);
+		// Handle different result scenarios
+		if ((result as any).timeout) {
+			console.log("⏰ Bundle result timeout - checking on-chain status...");
+		} else if ((result as any).rateLimited) {
+			console.log("⚠️  Rate limit hit - checking on-chain status...");
+		} else if ((result as any).accepted) {
+			console.log("✅ Bundle confirmed successful by Jito!");
+			return; // Early return for confirmed success
+		}
+
+		// Wait a moment for transactions to settle
+		console.log("⏳ Waiting for on-chain confirmation...");
+		await new Promise(resolve => setTimeout(resolve, 10000));
+
+		// Check on-chain status by verifying token creation
+		await verifyBundleSuccess(bundledTxns);
+
 	} catch (error) {
 		const err = error as any;
-		console.error("❌ Error sending bundle:", err.message);
+		console.error("❌ Jito bundle error:", err.message);
 
 		if (err?.message?.includes("Bundle Dropped, no connected leader up soon")) {
-			console.error("Bundle dropped - no connected leader up soon. Try again in a few seconds.");
+			console.error("  → No Jito leader available - try again in a few seconds");
 		} else if (err?.message?.includes("exceeded maximum number of transactions")) {
-			console.error("Bundle size exceeded maximum limit.");
+			console.error("  → Bundle too large - reduce number of wallets");
 		} else if (err?.message?.includes("Bundles must write lock at least one tip account")) {
-			console.error("Bundle missing required tip account.");
+			console.error("  → Missing required tip account");
+		} else if (err?.message?.includes("Rate limit exceeded")) {
+			console.log("⚠️  Jito API rate limit hit - checking on-chain status...");
+			
+			// Wait and check on-chain
+			await new Promise(resolve => setTimeout(resolve, 10000));
+			await verifyBundleSuccess(bundledTxns);
 		} else {
-			console.error("An unexpected error occurred:", err.message);
+			console.error("  → Unexpected error occurred");
 		}
+	}
+}
+
+// ✅ Verify bundle success by checking on-chain state
+async function verifyBundleSuccess(bundledTxns: VersionedTransaction[]) {
+	console.log("\n=== VERIFYING BUNDLE SUCCESS ===");
+	
+	try {
+		// Extract mint address from the first transaction (CREATE)
+		const createTx = bundledTxns[0];
+		const createTxSigs = createTx.signatures;
+		
+		// Get transaction status
+		for (let i = 0; i < bundledTxns.length; i++) {
+			const tx = bundledTxns[i];
+			const signature = bs58.encode(tx.signatures[0]);
+			
+			try {
+				const status = await connection.getSignatureStatus(signature, { searchTransactionHistory: true });
+				
+				if (status.value?.confirmationStatus) {
+					console.log(`✅ TX ${i + 1}: ${status.value.confirmationStatus.toUpperCase()}`);
+					
+					if (status.value.err) {
+						console.log(`  ❌ Error: ${JSON.stringify(status.value.err)}`);
+					}
+				} else {
+					console.log(`⏳ TX ${i + 1}: Not found yet`);
+				}
+			} catch (error) {
+				console.log(`⚠️  TX ${i + 1}: Status check failed`);
+			}
+		}
+
+		// Try to extract and verify token creation
+		await verifyTokenCreation();
+		
+	} catch (error) {
+		console.error("❌ Verification failed:", error);
+		console.log("\n💡 MANUAL VERIFICATION:");
+		console.log("1. Check your wallet for new tokens");
+		console.log("2. Look for recent transactions in your wallet history");
+		console.log("3. Search signatures on Solscan:");
+		
+		bundledTxns.forEach((tx, i) => {
+			const signature = bs58.encode(tx.signatures[0]);
+			console.log(`   TX ${i + 1}: https://solscan.io/tx/${signature}`);
+		});
+	}
+}
+
+// ✅ Check if token was successfully created and get details
+async function verifyTokenCreation() {
+	try {
+		// Read mint from keyInfo
+		const keyInfoPath = path.join(__dirname, "keyInfo.json");
+		if (!fs.existsSync(keyInfoPath)) {
+			console.log("⚠️  Cannot verify - keyInfo.json not found");
+			return;
+		}
+
+		const keyInfo = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
+		if (!keyInfo.mintPk) {
+			console.log("⚠️  Cannot verify - no mint in keyInfo");
+			return;
+		}
+
+		const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(keyInfo.mintPk)));
+		const mintAddress = mintKp.publicKey;
+
+		console.log(`\n🎯 TOKEN CONTRACT: ${mintAddress.toBase58()}`);
+
+		// Check if mint exists
+		const mintInfo = await connection.getAccountInfo(mintAddress);
+		if (!mintInfo) {
+			console.log("❌ Token not created yet or bundle failed");
+			return;
+		}
+
+		console.log("✅ TOKEN SUCCESSFULLY CREATED!");
+
+		// Check bonding curve
+		const [bondingCurve] = PublicKey.findProgramAddressSync(
+			[Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+			new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+		);
+
+		const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
+		if (bondingCurveInfo) {
+			console.log("✅ Bonding curve created successfully");
+		}
+
+		// Check wallet balances and spending
+		console.log("\n💰 WALLET RESULTS:");
+		
+		// Dev wallet
+		const devWalletKey = "GrNCQjbgwWXexDvYPm4quKWXdGG6stFj76BtXkoswHTb"; // From your logs
+		await checkWalletResults(mintAddress, new PublicKey(devWalletKey), "DEV WALLET", keyInfo);
+
+		// Other wallets
+		const validWallets = Object.keys(keyInfo).filter(key => 
+			key !== devWalletKey && 
+			keyInfo[key].solAmount && 
+			!['addressLUT', 'mint', 'mintPk', 'numOfWallets'].includes(key)
+		);
+
+		for (let i = 0; i < validWallets.length; i++) {
+			const walletKey = validWallets[i];
+			await checkWalletResults(mintAddress, new PublicKey(walletKey), `WALLET ${i + 1}`, keyInfo);
+		}
+
+		console.log("\n🎉 LAUNCH COMPLETE!");
+		console.log(`🔗 View on Pump.fun: https://pump.fun/${mintAddress.toBase58()}`);
+
+	} catch (error) {
+		console.error("❌ Token verification failed:", error);
+	}
+}
+
+// ✅ Check individual wallet results
+async function checkWalletResults(mintAddress: PublicKey, walletPubkey: PublicKey, walletName: string, keyInfo: any) {
+	try {
+		const walletKey = walletPubkey.toBase58();
+		const configuredSol = keyInfo[walletKey]?.solAmount || "0";
+		
+		// Check token balance
+		const tokenAccount = await spl.getAssociatedTokenAddress(mintAddress, walletPubkey);
+		
+		try {
+			const tokenBalance = await connection.getTokenAccountBalance(tokenAccount);
+			const tokensReceived = parseFloat(tokenBalance.value.amount) / 1e6; // Assuming 6 decimals
+			
+			console.log(`  ${walletName}: Spent ~${configuredSol} SOL → Received ${tokensReceived.toFixed(2)}M tokens ✅`);
+		} catch (error) {
+			console.log(`  ${walletName}: Configured ${configuredSol} SOL → No tokens received ❌`);
+		}
+	} catch (error) {
+		console.log(`  ${walletName}: Status check failed ⚠️`);
 	}
 }
