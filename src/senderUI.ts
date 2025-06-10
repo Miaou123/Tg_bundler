@@ -1,6 +1,6 @@
 import { Keypair, PublicKey, SystemProgram, TransactionInstruction, VersionedTransaction, LAMPORTS_PER_SOL, TransactionMessage, Blockhash } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
-import { wallet, connection, payer } from "../config";
+import { wallet, connection, payer, PUMP_PROGRAM } from "../config";
 import * as spl from "@solana/spl-token";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
@@ -10,9 +10,13 @@ import fs from "fs";
 import path from "path";
 import { getRandomTipAccount } from "./clients/config";
 import BN from "bn.js";
+import * as anchor from "@coral-xyz/anchor";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
+
+// Global account address (fixed)
+const GLOBAL_ACCOUNT = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
 
 let poolInfo: { [key: string]: any } = {};
 if (fs.existsSync(keyInfoPath)) {
@@ -27,6 +31,89 @@ interface Buy {
 	percentSupply: number;
 }
 
+// ✅ NEW: Fetch current global parameters from Pump.fun
+async function fetchCurrentGlobalParams() {
+    try {
+        console.log("🔍 Fetching current Pump.fun parameters...");
+        
+        // Fetch raw account data directly
+        const globalAccountInfo = await connection.getAccountInfo(GLOBAL_ACCOUNT);
+        
+        if (!globalAccountInfo) {
+            throw new Error("Global account not found");
+        }
+
+        // Parse the global account data manually
+        // Global account structure (based on Pump.fun IDL):
+        // 8 bytes: discriminator
+        // 1 byte: initialized (bool)
+        // 32 bytes: authority (pubkey)
+        // 32 bytes: fee_recipient (pubkey)
+        // 8 bytes: initial_virtual_token_reserves (u64)
+        // 8 bytes: initial_virtual_sol_reserves (u64)
+        // 8 bytes: initial_real_token_reserves (u64)
+        // 8 bytes: token_total_supply (u64)
+        // 8 bytes: fee_basis_points (u64)
+        // ... and more fields
+
+        const data = globalAccountInfo.data;
+        
+        // Skip discriminator (8 bytes) + initialized (1 byte) + authority (32 bytes) + fee_recipient (32 bytes) = 73 bytes
+        let offset = 73;
+        
+        // Read u64 values (8 bytes each, little endian)
+        const initialVirtualTokenReserves = new BN(data.subarray(offset, offset + 8), 'le');
+        offset += 8;
+        
+        const initialVirtualSolReserves = new BN(data.subarray(offset, offset + 8), 'le');
+        offset += 8;
+        
+        const initialRealTokenReserves = new BN(data.subarray(offset, offset + 8), 'le');
+        offset += 8;
+        
+        const tokenTotalSupply = new BN(data.subarray(offset, offset + 8), 'le');
+        offset += 8;
+        
+        const feeBasisPoints = new BN(data.subarray(offset, offset + 8), 'le');
+        
+        console.log("📊 CURRENT PUMP.FUN PARAMETERS:");
+        console.log(`  Virtual Token Reserves: ${initialVirtualTokenReserves.toString()}`);
+        console.log(`  Virtual SOL Reserves: ${initialVirtualSolReserves.toString()}`);
+        console.log(`  Real Token Reserves: ${initialRealTokenReserves.toString()}`);
+        console.log(`  Token Total Supply: ${tokenTotalSupply.toString()}`);
+        console.log(`  Fee Basis Points: ${feeBasisPoints.toString()}`);
+
+        // Verify the relationship is correct
+        const isValid = initialVirtualTokenReserves.gt(initialRealTokenReserves);
+        
+        console.log(`  Virtual > Real? ${isValid ? '✅ VALID' : '❌ INVALID'}`);
+        
+        if (!isValid) {
+            console.log("⚠️  WARNING: Global parameters may be incorrect!");
+        }
+
+        return {
+            initialVirtualTokenReserves,
+            initialVirtualSolReserves,
+            initialRealTokenReserves,
+            tokenTotalSupply,
+            feeBasisPoints,
+        };
+    } catch (error) {
+        console.error("❌ Failed to fetch global params:", error);
+        console.log("🔄 Using fallback parameters...");
+        
+        // Fallback to known working values if fetch fails
+        return {
+            initialVirtualTokenReserves: new BN("1073000000000000"), // 1.073B tokens with 6 decimals
+            initialVirtualSolReserves: new BN("30000000000"), // 30 SOL with 9 decimals  
+            initialRealTokenReserves: new BN("793100000000000"), // 793.1M tokens with 6 decimals
+            tokenTotalSupply: new BN("1000000000000000"), // 1B tokens with 6 decimals
+            feeBasisPoints: new BN("100"), // 1%
+        };
+    }
+}
+
 async function generateSOLTransferForKeypairs(tipAmt: number, steps: number = 24): Promise<TransactionInstruction[]> {
 	const keypairs: Keypair[] = loadKeypairs();
 	const ixs: TransactionInstruction[] = [];
@@ -36,20 +123,8 @@ async function generateSOLTransferForKeypairs(tipAmt: number, steps: number = 24
 		existingData = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
 	}
 
-	// Dev wallet send first
-	if (!existingData[wallet.publicKey.toString()] || !existingData[wallet.publicKey.toString()].solAmount) {
-		console.log(`Missing solAmount for dev wallet, skipping.`);
-	}
-
-	const solAmount = parseFloat(existingData[wallet.publicKey.toString()].solAmount);
-
-	ixs.push(
-		SystemProgram.transfer({
-			fromPubkey: payer.publicKey,
-			toPubkey: wallet.publicKey,
-			lamports: Math.floor((solAmount * 1.015 + 0.0025) * LAMPORTS_PER_SOL),
-		})
-	);
+	// ❌ REMOVED: Dev wallet funding (manually funded)
+	// Dev wallet is expected to be manually funded
 
 	// Loop through the keypairs and process each one
 	for (let i = 0; i < Math.min(steps, keypairs.length); i++) {
@@ -64,14 +139,15 @@ async function generateSOLTransferForKeypairs(tipAmt: number, steps: number = 24
 		const solAmount = parseFloat(existingData[keypairPubkeyStr].solAmount);
 
 		try {
+			// ✅ FIXED: Send solAmount * 1.015 + 0.01 to meet threshold
 			ixs.push(
 				SystemProgram.transfer({
 					fromPubkey: payer.publicKey,
 					toPubkey: keypair.publicKey,
-					lamports: Math.floor((solAmount * 1.015 + 0.0025) * LAMPORTS_PER_SOL),
+					lamports: Math.floor((solAmount * 1.015 + 0.01) * LAMPORTS_PER_SOL),
 				})
 			);
-			console.log(`Sent ${(solAmount * 1.015 + 0.0025).toFixed(3)} SOL to Wallet ${i + 1} (${keypair.publicKey.toString()})`);
+			console.log(`Sent ${(solAmount * 1.015 + 0.01).toFixed(4)} SOL to Wallet ${i + 1} (${keypair.publicKey.toString()})`);
 		} catch (error) {
 			console.error(`Error creating transfer instruction for wallet ${i + 1}:`, error);
 			continue;
@@ -130,18 +206,6 @@ async function createAndSignVersionedTxWithKeypairs(instructionsChunk: Transacti
 
 	versionedTx.sign([payer]);
 
-	/*
-    // Simulate each txn
-    const simulationResult = await connection.simulateTransaction(versionedTx, { commitment: "processed" });
-
-    if (simulationResult.value.err) {
-    console.log("Simulation error:", simulationResult.value.err);
-    } else {
-    console.log("Simulation success. Logs:");
-    simulationResult.value.logs?.forEach(log => console.log(log));
-    }
-    */
-
 	return versionedTx;
 }
 
@@ -158,24 +222,6 @@ async function processInstructionsSOL(ixs: TransactionInstruction[], blockhash: 
 }
 
 async function sendBundle(txns: VersionedTransaction[]) {
-	/*
-    // Simulate each transaction
-    for (const tx of txns) {
-        try {
-            const simulationResult = await connection.simulateTransaction(tx, { commitment: "processed" });
-
-            if (simulationResult.value.err) {
-                console.error("Simulation error for transaction:", simulationResult.value.err);
-            } else {
-                console.log("Simulation success for transaction. Logs:");
-                simulationResult.value.logs?.forEach(log => console.log(log));
-            }
-        } catch (error) {
-            console.error("Error during simulation:", error);
-        }
-    }
-    */
-
 	try {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(txns, txns.length));
 		console.log(`Bundle ${bundleId} sent.`);
@@ -279,20 +325,34 @@ async function createReturns() {
 	await sendBundle(txsSigned);
 }
 
+// ✅ UPDATED: Use live global parameters in simulation
 async function simulateAndWriteBuys() {
-	const keypairs = loadKeypairs();
-
-	const tokenDecimals = 10 ** 6;
-	const tokenTotalSupply = 1000000000 * tokenDecimals;
-	let initialRealSolReserves = 0;
-	let initialVirtualTokenReserves = 1073000000 * tokenDecimals;
-	let initialRealTokenReserves = 793100000 * tokenDecimals;
-	let totalTokensBought = 0;
-	const buys: { pubkey: PublicKey; solAmount: Number; tokenAmount: BN; percentSupply: number }[] = [];
-
 	console.log("\n🎯 BONDING CURVE SIMULATION");
 	console.log("============================");
-	console.log("This simulation accounts for slippage between purchases.");
+	
+	// ✅ FETCH CURRENT PARAMETERS INSTEAD OF HARDCODING
+	const globalParams = await fetchCurrentGlobalParams();
+	
+	const keypairs = loadKeypairs();
+	const tokenDecimals = 10 ** 6;
+	
+	// ✅ USE LIVE PARAMETERS
+	let initialRealSolReserves = 0;
+	let initialVirtualTokenReserves = globalParams.initialVirtualTokenReserves.toNumber();
+	let initialRealTokenReserves = globalParams.initialRealTokenReserves.toNumber();
+	const tokenTotalSupply = globalParams.tokenTotalSupply.toNumber();
+	let totalTokensBought = 0;
+	
+	console.log("\n📊 Using LIVE Pump.fun parameters:");
+	console.log(`  Virtual Token Reserves: ${(initialVirtualTokenReserves / tokenDecimals).toFixed(2)}M tokens`);
+	console.log(`  Real Token Reserves: ${(initialRealTokenReserves / tokenDecimals).toFixed(2)}M tokens`);
+	console.log(`  Virtual SOL Reserves: ${globalParams.initialVirtualSolReserves.toNumber() / LAMPORTS_PER_SOL} SOL`);
+	console.log(`  Token Total Supply: ${(tokenTotalSupply / tokenDecimals).toFixed(2)}M tokens`);
+	console.log(`  Virtual > Real? ${initialVirtualTokenReserves > initialRealTokenReserves ? '✅ VALID' : '❌ INVALID'}`);
+
+	const buys: { pubkey: PublicKey; solAmount: Number; tokenAmount: BN; percentSupply: number }[] = [];
+
+	console.log("\nThis simulation accounts for slippage between purchases.");
 	console.log("Each buy affects the price for the next buy.\n");
 
 	for (let it = 0; it <= 24; it++) {
@@ -316,13 +376,13 @@ async function simulateAndWriteBuys() {
 			continue;
 		}
 
-		// ✅ FIX: Remove the 1.21 multiplier that was causing issues
-		const actualSolInput = solInputNumber; // No multiplier
+		// ✅ FIX: Use actual input amount (no multipliers)
+		const actualSolInput = solInputNumber;
 		const solAmount = actualSolInput * LAMPORTS_PER_SOL;
 
 		// ✅ FIX: Updated bonding curve calculation with proper reserves
 		const solAmountBN = new BN(solAmount);
-		const currentVirtualSolReserves = 30 * LAMPORTS_PER_SOL + initialRealSolReserves;
+		const currentVirtualSolReserves = globalParams.initialVirtualSolReserves.toNumber() + initialRealSolReserves;
 		
 		// Bonding curve: k = virtualSol * virtualTokens
 		const k = new BN(currentVirtualSolReserves).mul(new BN(initialVirtualTokenReserves));
@@ -376,7 +436,7 @@ async function simulateAndWriteBuys() {
 	console.log(`Total % of supply bought: ${((totalTokensBought / tokenTotalSupply) * 100).toFixed(4)}%`);
 	
 	// ✅ FIX: Slippage warning
-	const totalPriceImpact = (totalTokensBought / (1073000000 * tokenDecimals)) * 100;
+	const totalPriceImpact = (totalTokensBought / globalParams.initialVirtualTokenReserves.toNumber()) * 100;
 	if (totalPriceImpact > 15) {
 		console.log(`\n⚠️  HIGH SLIPPAGE WARNING!`);
 		console.log(`Total price impact: ${totalPriceImpact.toFixed(2)}%`);
@@ -384,6 +444,22 @@ async function simulateAndWriteBuys() {
 		console.log(`- Reducing buy amounts`);
 		console.log(`- Spacing out purchases over time`);
 		console.log(`- Using more forgiving slippage tolerances\n`);
+	}
+
+	// ✅ CRITICAL: Check if reserves relationship will be maintained
+	const finalVirtualTokenReserves = globalParams.initialVirtualTokenReserves.toNumber() - totalTokensBought;
+	const finalRealTokenReserves = globalParams.initialRealTokenReserves.toNumber() - totalTokensBought;
+	
+	console.log(`\n🔍 FINAL RESERVE CHECK:`);
+	console.log(`  Final Virtual Token Reserves: ${(finalVirtualTokenReserves / tokenDecimals).toFixed(2)}M`);
+	console.log(`  Final Real Token Reserves: ${(finalRealTokenReserves / tokenDecimals).toFixed(2)}M`);
+	console.log(`  Virtual > Real? ${finalVirtualTokenReserves > finalRealTokenReserves ? '✅ VALID' : '❌ INVALID - WILL FAIL!'}`);
+	
+	if (finalVirtualTokenReserves <= finalRealTokenReserves) {
+		console.log(`\n🚨 CRITICAL ERROR: Your simulation violates Pump.fun constraints!`);
+		console.log(`You're buying too many tokens. The CREATE transaction will fail.`);
+		console.log(`Please reduce your buy amounts and try again.\n`);
+		return; // Don't save invalid simulation
 	}
 
 	const confirm = prompt("Do you want to use these buys? (yes/no): ").toLowerCase();

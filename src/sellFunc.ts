@@ -20,7 +20,6 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 	return Array.from({ length: Math.ceil(array.length / size) }, (v, i) => array.slice(i * size, i * size + size));
 }
 
-// ✅ FIXED: Use the same sendBundle pattern from jitoPool.ts
 async function sendBundle(bundledTxns: VersionedTransaction[]) {
 	if (bundledTxns.length === 0) {
 		console.log("❌ No transactions to send");
@@ -34,12 +33,15 @@ async function sendBundle(bundledTxns: VersionedTransaction[]) {
 		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
 		console.log(`✅ Sell bundle sent successfully!`);
 		
-		const bundleIdStr = bundleId.toString();
+		let bundleIdStr;
+		try {
+			bundleIdStr = bundleId?.toString() || 'unknown';
+		} catch {
+			bundleIdStr = 'unknown';
+		}
 		console.log(`🆔 Bundle ID: ${bundleIdStr}`);
 
 		console.log("⏳ Waiting for sell bundle result...");
-		
-		// Wait 10 seconds then check on-chain directly
 		await new Promise(resolve => setTimeout(resolve, 10000));
 		
 		console.log("🔍 Checking sell transaction status...");
@@ -72,10 +74,9 @@ async function sendBundle(bundledTxns: VersionedTransaction[]) {
 	}
 }
 
-// ✅ FIXED: Proper sell verification
 async function verifySellSuccess(bundledTxns: VersionedTransaction[]): Promise<boolean> {
 	console.log("\n=== VERIFYING SELL SUCCESS ===");
-	
+
 	try {
 		let successCount = 0;
 		let totalChecked = 0;
@@ -121,274 +122,273 @@ async function verifySellSuccess(bundledTxns: VersionedTransaction[]): Promise<b
 	}
 }
 
-// ✅ MAIN SELL FUNCTION - Fixed with proper Anchor setup and bundle strategy
+// ✅ NEW: Interface for wallets with token balances
+interface WalletWithTokens {
+	keypair: Keypair;
+	tokenBalance: number;
+	walletName: string;
+}
+
+// ✅ NEW: Check ALL wallets on-chain for token balances
+async function getAllWalletsWithTokens(mintAddress: PublicKey): Promise<WalletWithTokens[]> {
+	console.log("\n=== SCANNING ALL WALLETS FOR TOKENS ===");
+	console.log(`🔍 Checking token: ${mintAddress.toBase58()}`);
+	
+	const walletsWithTokens: WalletWithTokens[] = [];
+	const keypairs = loadKeypairs();
+	
+	// Check dev wallet first
+	console.log("\n👤 Checking DEV WALLET...");
+	try {
+		const devTokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
+		const devBalance = await connection.getTokenAccountBalance(devTokenAccount);
+		const devTokens = Number(devBalance.value.amount);
+		
+		if (devTokens > 0) {
+			console.log(`✅ DEV WALLET: ${(devTokens / 1e6).toFixed(2)}M tokens`);
+			walletsWithTokens.push({
+				keypair: wallet,
+				tokenBalance: devTokens,
+				walletName: "DEV WALLET"
+			});
+		} else {
+			console.log(`⚠️  DEV WALLET: No tokens found`);
+		}
+	} catch (error) {
+		console.log(`⚠️  DEV WALLET: No token account found`);
+	}
+
+	// Check all 24 keypairs
+	console.log("\n👥 Checking ALL 24 WALLETS...");
+	for (let i = 0; i < keypairs.length; i++) {
+		const keypair = keypairs[i];
+		try {
+			const tokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, keypair.publicKey);
+			const balance = await connection.getTokenAccountBalance(tokenAccount);
+			const tokens = Number(balance.value.amount);
+			
+			if (tokens > 0) {
+				console.log(`✅ Wallet ${i + 1}: ${(tokens / 1e6).toFixed(2)}M tokens (${keypair.publicKey.toString().slice(0, 8)}...)`);
+				walletsWithTokens.push({
+					keypair: keypair,
+					tokenBalance: tokens,
+					walletName: `Wallet ${i + 1}`
+				});
+			} else {
+				console.log(`⚪ Wallet ${i + 1}: No tokens`);
+			}
+		} catch (error) {
+			console.log(`⚪ Wallet ${i + 1}: No token account`);
+		}
+	}
+
+	console.log(`\n📊 SCAN COMPLETE:`);
+	console.log(`   Total wallets with tokens: ${walletsWithTokens.length}`);
+	console.log(`   Total tokens found: ${(walletsWithTokens.reduce((sum, w) => sum + w.tokenBalance, 0) / 1e6).toFixed(2)}M`);
+
+	return walletsWithTokens;
+}
+
+// ✅ MAIN SELL FUNCTION - Using Pump.Fun IDL like buy transactions
 export async function sellXPercentagePF() {
 	console.log("🔥 PUMP.FUN SELL BUNDLER");
 	console.log("========================");
-	
-	// ✅ FIX: Use same Anchor setup pattern as jitoPool.ts
-	const provider = new anchor.AnchorProvider(
-		connection,
-		new anchor.Wallet(wallet),
-		{ commitment: "confirmed" }
-	);
 
-	const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
-	const program = new anchor.Program(IDL_PumpFun, provider);
-
-	// Load keyInfo
-	let poolInfo: { [key: string]: any } = {};
-	if (fs.existsSync(keyInfoPath)) {
-		const data = fs.readFileSync(keyInfoPath, "utf-8");
-		poolInfo = JSON.parse(data);
-	}
-
-	if (!poolInfo.addressLUT || !poolInfo.mintPk) {
-		console.log("❌ ERROR: Missing LUT or mint in keyInfo!");
-		return;
-	}
-
-	const lut = new PublicKey(poolInfo.addressLUT.toString());
-	const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
-
-	if (lookupTableAccount == null) {
-		console.log("❌ ERROR: Lookup table not found on-chain!");
-		return;
-	}
-
-	const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(poolInfo.mintPk)));
-	console.log(`🎯 Token: ${mintKp.publicKey.toBase58()}`);
-
-	// Get sell parameters
-	const supplyPercent = +prompt("Percentage to sell (Ex. 1 for 1%): ") / 100;
-	const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
-
-	if (supplyPercent <= 0 || supplyPercent > 0.25) {
-		console.log("❌ Invalid percentage! Must be between 0.01% and 25%");
-		return;
-	}
-
-	console.log(`📊 Selling ${(supplyPercent * 100).toFixed(2)}% of each wallet's tokens`);
-
-	// ✅ FIX: Pre-calculate PDAs (same pattern as jitoPool.ts)
-	const [bondingCurve] = PublicKey.findProgramAddressSync(
-		[Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
-		PUMP_PROGRAM
-	);
-	const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-		[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
-		spl.ASSOCIATED_TOKEN_PROGRAM_ID
-	);
-	const [creatorVault] = PublicKey.findProgramAddressSync(
-		[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
-		PUMP_PROGRAM
-	);
-
-	// Check current supply and calculate total sell amount
-	const mintInfo = await connection.getTokenSupply(mintKp.publicKey);
-	let sellTotalAmount = 0;
-
-	const keypairs = loadKeypairs();
-	const chunkedKeypairs = chunkArray(keypairs, 6); // 6 wallets per transfer transaction
-	const bundledTxns: VersionedTransaction[] = [];
-
-	const PayerTokenATA = await spl.getAssociatedTokenAddress(mintKp.publicKey, payer.publicKey);
-	const { blockhash } = await connection.getLatestBlockhash();
-
-	console.log("\n=== BUILDING TRANSFER TRANSACTIONS ===");
-
-	// ✅ Step 1: Transfer tokens from all wallets to payer (multiple TXs)
-	for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
-		const chunk = chunkedKeypairs[chunkIndex];
-		const instructionsForChunk: TransactionInstruction[] = [];
-		const isFirstChunk = chunkIndex === 0;
-
-		console.log(`🔨 Building Transfer TX ${chunkIndex + 1}: ${chunk.length} wallets`);
-
-		// ✅ FIX: Add compute budget
-		instructionsForChunk.push(
-			ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 + (chunk.length * 50000) }),
-			ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 })
+	try {
+		// Setup Anchor like jitoPool.ts
+		const provider = new anchor.AnchorProvider(
+			connection,
+			new anchor.Wallet(wallet),
+			{ commitment: "confirmed" }
 		);
 
-		// Handle dev wallet in first chunk
-		if (isFirstChunk) {
-			const transferAmount = await getSellBalance(wallet, mintKp.publicKey, supplyPercent);
-			if (transferAmount > 0) {
-				sellTotalAmount += transferAmount;
-				console.log(`  💰 Dev wallet: ${transferAmount / 1e6}M tokens`);
+		const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
+		const program = new anchor.Program(IDL_PumpFun, provider);
 
-				// Create payer ATA if needed
-				const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
-					payer.publicKey, 
-					PayerTokenATA, 
-					payer.publicKey, 
-					mintKp.publicKey
-				);
-
-				const devTokenATA = await spl.getAssociatedTokenAddress(mintKp.publicKey, wallet.publicKey);
-				const transferIx = spl.createTransferInstruction(
-					devTokenATA, 
-					PayerTokenATA, 
-					wallet.publicKey, 
-					transferAmount
-				);
-
-				instructionsForChunk.push(ataIx, transferIx);
-			}
+		// Load keyInfo for LUT and mint
+		let poolInfo: { [key: string]: any } = {};
+		if (fs.existsSync(keyInfoPath)) {
+			const data = fs.readFileSync(keyInfoPath, "utf-8");
+			poolInfo = JSON.parse(data);
 		}
 
-		// Handle chunk wallets
-		for (let keypair of chunk) {
-			const transferAmount = await getSellBalance(keypair, mintKp.publicKey, supplyPercent);
-			if (transferAmount > 0) {
-				sellTotalAmount += transferAmount;
-				console.log(`  💰 ${keypair.publicKey.toString().slice(0, 8)}...: ${transferAmount / 1e6}M tokens`);
-
-				const TokenATA = await spl.getAssociatedTokenAddress(mintKp.publicKey, keypair.publicKey);
-				const transferIx = spl.createTransferInstruction(
-					TokenATA, 
-					PayerTokenATA, 
-					keypair.publicKey, 
-					transferAmount
-				);
-				instructionsForChunk.push(transferIx);
-			}
+		if (!poolInfo.addressLUT || !poolInfo.mintPk) {
+			console.log("❌ ERROR: Missing LUT or mint in keyInfo!");
+			return;
 		}
 
-		if (instructionsForChunk.length > 2) { // More than just compute budget
+		const lut = new PublicKey(poolInfo.addressLUT.toString());
+		const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+
+		if (lookupTableAccount == null) {
+			console.log("❌ ERROR: Lookup table not found on-chain!");
+			return;
+		}
+
+		const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(poolInfo.mintPk)));
+		console.log(`🎯 Token: ${mintKp.publicKey.toBase58()}`);
+
+		// Get sell parameters
+		const supplyPercentInput = prompt("Percentage to sell (Ex. 1 for 1%, 100 for 100%): ");
+		const supplyPercentNum = parseFloat(supplyPercentInput.replace('%', ''));
+		
+		if (isNaN(supplyPercentNum) || supplyPercentNum <= 0 || supplyPercentNum > 100) {
+			console.log("❌ Invalid percentage! Must be between 0.01 and 100");
+			return;
+		}
+		
+		const supplyPercent = supplyPercentNum / 100;
+		const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
+
+		if (supplyPercent > 0.25) {
+			console.log("⚠️  WARNING: Selling more than 25% may cause high price impact!");
+			const proceed = prompt("Continue anyway? (y/n): ").toLowerCase();
+			if (proceed !== 'y') return;
+		}
+
+		console.log(`📊 Selling ${(supplyPercent * 100).toFixed(2)}% of each wallet's tokens`);
+
+		// ✅ Get ALL wallets with tokens by checking on-chain
+		const walletsWithTokens = await getAllWalletsWithTokens(mintKp.publicKey);
+		
+		if (walletsWithTokens.length === 0) {
+			console.log("❌ No wallets found with tokens!");
+			console.log("💡 Make sure this is the correct token address");
+			return;
+		}
+
+		// ✅ Pre-calculate PDAs (same as jitoPool.ts)
+		const [bondingCurve] = PublicKey.findProgramAddressSync(
+			[Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
+			PUMP_PROGRAM
+		);
+		const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+			[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
+			spl.ASSOCIATED_TOKEN_PROGRAM_ID
+		);
+		const [creatorVault] = PublicKey.findProgramAddressSync(
+			[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
+			PUMP_PROGRAM
+		);
+
+		// ✅ Build individual sell transactions for each wallet
+		console.log("\n=== BUILDING SELL TRANSACTIONS ===");
+		const bundledTxns: VersionedTransaction[] = [];
+		const { blockhash } = await connection.getLatestBlockhash();
+
+		for (let i = 0; i < walletsWithTokens.length; i++) {
+			const walletData = walletsWithTokens[i];
+			const isLastWallet = i === walletsWithTokens.length - 1;
+			
+			// Calculate sell amount
+			const sellAmount = Math.floor(walletData.tokenBalance * supplyPercent);
+			
+			if (sellAmount <= 0) {
+				console.log(`⏭️  ${walletData.walletName}: Skipping (${sellAmount} tokens)`);
+				continue;
+			}
+
+			console.log(`🔨 Building sell TX for ${walletData.walletName}: ${(sellAmount / 1e6).toFixed(2)}M tokens`);
+
+			// Build sell instructions
+			const sellTxIxs: TransactionInstruction[] = [];
+			
+			// Compute budget
+			sellTxIxs.push(
+				ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
+				ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
+			);
+
+			// Get wallet's token account
+			const walletTokenATA = spl.getAssociatedTokenAddressSync(mintKp.publicKey, walletData.keypair.publicKey);
+
+			// ✅ Use Pump.Fun sell instruction (same pattern as buy in jitoPool.ts)
+			const sellIx = await (program.methods as any)
+				.sell(new BN(sellAmount), new BN(0)) // sell amount, min SOL out (0 = no slippage protection)
+				.accounts({
+					global: globalAccount,
+					feeRecipient: feeRecipient,
+					mint: mintKp.publicKey,
+					bondingCurve: bondingCurve,
+					associatedBondingCurve: associatedBondingCurve,
+					associatedUser: walletTokenATA,
+					user: walletData.keypair.publicKey,
+					systemProgram: SystemProgram.programId,
+					creatorVault: creatorVault,
+					tokenProgram: spl.TOKEN_PROGRAM_ID,
+					eventAuthority: eventAuthority,
+					program: PUMP_PROGRAM,
+				})
+				.instruction();
+
+			sellTxIxs.push(sellIx);
+
+			// Add Jito tip to the last transaction
+			if (isLastWallet) {
+				console.log(`  💰 Adding Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
+				sellTxIxs.push(
+					SystemProgram.transfer({
+						fromPubkey: walletData.keypair.publicKey,
+						toPubkey: getRandomTipAccount(),
+						lamports: BigInt(jitoTipAmt),
+					})
+				);
+			}
+
+			// Build transaction
 			const message = new TransactionMessage({
-				payerKey: payer.publicKey,
+				payerKey: walletData.keypair.publicKey,
 				recentBlockhash: blockhash,
-				instructions: instructionsForChunk,
+				instructions: sellTxIxs,
 			}).compileToV0Message([lookupTableAccount]);
 
 			const versionedTx = new VersionedTransaction(message);
 
 			// Size check
-			const serializedMsg = versionedTx.serialize();
-			console.log(`  📏 Size: ${serializedMsg.length}/1232 bytes`);
-			if (serializedMsg.length > 1232) {
-				console.log("  ❌ Transaction too big");
+			const txSize = versionedTx.serialize().length;
+			console.log(`  📏 Size: ${txSize}/1232 bytes`);
+			
+			if (txSize > 1232) {
+				console.log(`  ❌ Transaction too large, skipping ${walletData.walletName}`);
 				continue;
 			}
 
-			// ✅ FIX: Sign with payer first, then wallets
-			versionedTx.sign([payer]);
-
-			if (isFirstChunk) {
-				versionedTx.sign([wallet]); // Dev wallet
-			}
-
-			for (let keypair of chunk) {
-				versionedTx.sign([keypair]);
-			}
-
+			// Sign transaction
+			versionedTx.sign([walletData.keypair]);
 			bundledTxns.push(versionedTx);
-			console.log(`  ✅ Transfer TX ${chunkIndex + 1} built`);
+			
+			console.log(`  ✅ ${walletData.walletName} sell TX built`);
 		}
-	}
 
-	console.log(`\n📊 TOTAL TOKENS TO SELL: ${sellTotalAmount / 1e6}M tokens`);
+		if (bundledTxns.length === 0) {
+			console.log("❌ No valid sell transactions were built!");
+			return;
+		}
 
-	// ✅ Safety check
-	if (+mintInfo.value.amount * 0.25 <= sellTotalAmount) {
-		console.log("❌ Price impact too high!");
-		console.log("Cannot sell more than 25% of supply at a time.");
-		return;
-	}
+		// ✅ Show summary and confirm
+		console.log(`\n=== SELL BUNDLE SUMMARY ===`);
+		console.log(`📦 Transactions: ${bundledTxns.length}`);
+		console.log(`👥 Wallets selling: ${walletsWithTokens.length}`);
+		console.log(`📊 Percentage: ${(supplyPercent * 100).toFixed(2)}% per wallet`);
+		console.log(`💰 Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
+		
+		const confirm = prompt("\n🔥 EXECUTE SELL BUNDLE? (y/yes): ").toLowerCase();
+		if (confirm !== 'yes' && confirm !== 'y') {
+			console.log("Sell cancelled.");
+			return;
+		}
 
-	// ✅ Step 2: Create sell transaction (final TX in bundle)
-	console.log("\n=== BUILDING SELL TRANSACTION ===");
-	
-	const payerNum = randomInt(0, Math.min(keypairs.length - 1, 23));
-	const payerKey = keypairs[payerNum];
+		// ✅ Send bundle
+		const success = await sendBundle(bundledTxns);
 
-	const sellPayerIxs: TransactionInstruction[] = [];
+		if (success) {
+			console.log("🎉 Sell completed successfully!");
+			console.log("💡 Check your wallets for received SOL");
+		} else {
+			console.log("❌ Sell bundle failed");
+		}
 
-	// ✅ FIX: Add compute budget for sell
-	sellPayerIxs.push(
-		ComputeBudgetProgram.setComputeUnitLimit({ units: 400000 }),
-		ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200000 })
-	);
-
-	// ✅ FIX: Use proper Anchor instruction with correct accounts
-	const sellIx = await (program.methods as any)
-		.sell(new BN(sellTotalAmount), new BN(0)) // minSolOutput = 0 (no slippage protection)
-		.accounts({
-			global: globalAccount,
-			feeRecipient: feeRecipient,
-			mint: mintKp.publicKey,
-			bondingCurve: bondingCurve,
-			associatedBondingCurve: associatedBondingCurve,
-			associatedUser: PayerTokenATA,
-			user: payer.publicKey,
-			systemProgram: SystemProgram.programId,
-			creatorVault: creatorVault,
-			tokenProgram: spl.TOKEN_PROGRAM_ID,
-			eventAuthority: eventAuthority,
-			program: PUMP_PROGRAM,
-		})
-		.instruction();
-
-	sellPayerIxs.push(
-		sellIx,
-		SystemProgram.transfer({
-			fromPubkey: payer.publicKey,
-			toPubkey: getRandomTipAccount(),
-			lamports: BigInt(jitoTipAmt),
-		})
-	);
-
-	const sellMessage = new TransactionMessage({
-		payerKey: payerKey.publicKey,
-		recentBlockhash: blockhash,
-		instructions: sellPayerIxs,
-	}).compileToV0Message([lookupTableAccount]);
-
-	const sellTx = new VersionedTransaction(sellMessage);
-
-	// Size check
-	const sellSize = sellTx.serialize().length;
-	console.log(`📏 Sell TX size: ${sellSize}/1232 bytes`);
-	if (sellSize > 1232) {
-		console.log("❌ Sell transaction too big");
-		return;
-	}
-
-	sellTx.sign([payer, payerKey]);
-	bundledTxns.push(sellTx);
-
-	console.log(`✅ Sell TX built with ${sellTotalAmount / 1e6}M tokens`);
-
-	// ✅ Step 3: Send bundle
-	console.log(`\n=== LAUNCHING SELL BUNDLE ===`);
-	console.log(`📦 Bundle: ${bundledTxns.length} transactions`);
-	console.log(`💰 Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
-	
-	const confirm = prompt("\n🔥 EXECUTE SELL BUNDLE? (yes/no): ").toLowerCase();
-	if (confirm !== 'yes') {
-		console.log("Sell cancelled.");
-		return;
-	}
-
-	const success = await sendBundle(bundledTxns);
-	
-	if (success) {
-		console.log("🎉 Sell completed successfully!");
-	} else {
-		console.log("❌ Sell bundle failed");
-	}
-}
-
-// ✅ Helper function to get sell balance
-async function getSellBalance(keypair: Keypair, mint: PublicKey, supplyPercent: number): Promise<number> {
-	try {
-		const tokenAccountPubKey = spl.getAssociatedTokenAddressSync(mint, keypair.publicKey);
-		const balance = await connection.getTokenAccountBalance(tokenAccountPubKey);
-		const amount = Math.floor(Number(balance.value.amount) * supplyPercent);
-		return amount;
-	} catch (e) {
-		return 0;
+	} catch (error) {
+		console.error("❌ Sell function error:", error);
 	}
 }

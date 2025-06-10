@@ -16,6 +16,7 @@ src/keypairs/
 blockengine.json
 payer.json
 *.json.bak
+*.json
 
 # Key info files containing wallet data
 src/keyInfo.json

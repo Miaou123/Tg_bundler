@@ -316,12 +316,28 @@ async function buildMultiTransactionBundle(
             wallet.publicKey, devAta, wallet.publicKey, mintKp.publicKey
         );
         
-        // Calculate reasonable minimum tokens (about 90% of expected amount)
+        // 🐛 ADD DEBUG LOGS FOR DEV WALLET
+        console.log(`🐛 RAW DEBUG - DEV BUY:`);
+        console.log(`  devInfo.tokenAmount (raw): "${devInfo.tokenAmount}"`);
+        console.log(`  devInfo.tokenAmount type: ${typeof devInfo.tokenAmount}`);
+        console.log(`  devInfo.solAmount (raw): "${devInfo.solAmount}"`);
+        console.log(`  devInfo.solAmount type: ${typeof devInfo.solAmount}`);
+
         const expectedTokens = new BN(devInfo.tokenAmount);
-        const minTokens = expectedTokens.muln(90).divn(100); // 90% of expected
-        const devSolAmount = new BN(Math.floor(parseFloat(devInfo.solAmount) * LAMPORTS_PER_SOL));
+        const minTokens = expectedTokens.muln(90).divn(100);
         
-        console.log(`  Expected: ${expectedTokens.toNumber() / 1e6}M tokens, Min: ${minTokens.toNumber() / 1e6}M tokens`);
+        console.log(`  🔧 FIXED - minTokens (base units): ${minTokens.toString()}`);
+        console.log(`  🔧 FIXED - minTokens human: ${minTokens.toNumber()}M tokens`);
+        
+        const devSolAmount = new BN(Math.floor(parseFloat(devInfo.solAmount) * LAMPORTS_PER_SOL));
+        console.log(`  devSolAmount BN: ${devSolAmount.toString()}`);
+        console.log(`  devSolAmount (SOL): ${devSolAmount.toNumber() / LAMPORTS_PER_SOL}`);
+        
+        // Test BN conversion
+        console.log(`  🧪 BN test - should be 1000000: ${new BN("1000000").toString()}`);
+        console.log(`  🧪 BN test - large number: ${new BN("262168765743074").toString()}`);
+        
+        console.log(`  Expected: ${expectedTokens.toNumber() / 1e6}M tokens, Min: ${minTokens.toNumber()}M tokens`);
         
         const devBuyIx = await (program.methods as any)
             .buy(minTokens, devSolAmount)
@@ -409,8 +425,26 @@ async function buildMultiTransactionBundle(
                 continue;
             }
 
+            // 🐛 ADD DEBUG LOGS FOR WALLET BUYS (only for first wallet in first chunk to avoid spam)
+            if (chunkIndex === 0 && index === chunk[0].index) {
+                console.log(`    🐛 WALLET DEBUG - Wallet ${index}:`);
+                console.log(`      keypairInfo.tokenAmount (raw): "${keypairInfo.tokenAmount}"`);
+                console.log(`      keypairInfo.tokenAmount type: ${typeof keypairInfo.tokenAmount}`);
+                console.log(`      keypairInfo.solAmount (raw): "${keypairInfo.solAmount}"`);
+                console.log(`      keypairInfo.solAmount type: ${typeof keypairInfo.solAmount}`);
+            }
+
             const expectedTokens = new BN(keypairInfo.tokenAmount);
-            const minTokens = expectedTokens.muln(90).divn(100); // 90% of expected
+            const minTokens = expectedTokens.muln(90).divn(100); 
+            
+            if (chunkIndex === 0 && index === chunk[0].index) {
+                console.log(`      expectedTokens BN: ${expectedTokens.toString()}`);
+                console.log(`      expectedTokens human: ${expectedTokens.toNumber() / 1e6}M tokens`);
+                console.log(`      🔧 FIXED - minTokens (base units): ${minTokens.toString()}`);
+                console.log(`      🔧 FIXED - minTokens human: ${minTokens.toNumber()}M tokens`);
+                console.log(`      solAmount BN: ${solAmount.toString()}`);
+                console.log(`      solAmount (SOL): ${solAmount.toNumber() / LAMPORTS_PER_SOL}`);
+            }
             
             // Buy instruction
             const buyIx = await (program.methods as any)
