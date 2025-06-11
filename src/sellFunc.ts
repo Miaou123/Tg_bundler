@@ -1,5 +1,6 @@
-import { connection, rpc, wallet, global as globalAccount, feeRecipient, PUMP_PROGRAM, payer, eventAuthority } from "../config";
-import { PublicKey, VersionedTransaction, SYSVAR_RENT_PUBKEY, TransactionMessage, SystemProgram, Keypair, LAMPORTS_PER_SOL, ComputeBudgetProgram, TransactionInstruction } from "@solana/web3.js";
+// ✅ UNIFIED SELL FUNCTION - Auto-detects Pump.fun vs PumpSwap
+import { connection, wallet, payer, PUMP_PROGRAM, feeRecipient, eventAuthority, global as globalAccount } from "../config";
+import { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, Keypair, LAMPORTS_PER_SOL, ComputeBudgetProgram, TransactionInstruction } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
@@ -8,387 +9,884 @@ import * as spl from "@solana/spl-token";
 import bs58 from "bs58";
 import path from "path";
 import fs from "fs";
-import * as anchor from "@coral-xyz/anchor";
-import { randomInt } from "crypto";
 import { getRandomTipAccount } from "./clients/config";
 import BN from "bn.js";
+import * as anchor from "@coral-xyz/anchor";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
 
-function chunkArray<T>(array: T[], size: number): T[][] {
-	return Array.from({ length: Math.ceil(array.length / size) }, (v, i) => array.slice(i * size, i * size + size));
+// PumpSwap program constants
+const PUMPSWAP_PROGRAM_ID = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
+
+// Wallet selection modes
+enum WalletSelectionMode {
+    ALL_WALLETS = 1,        // Sell from all wallets (creator + bundle wallets)
+    BUNDLE_ONLY = 2,        // Sell only from bundle wallets (exclude creator)
+    CREATOR_ONLY = 3        // Sell only from creator wallet
 }
 
-async function sendBundle(bundledTxns: VersionedTransaction[]) {
-	if (bundledTxns.length === 0) {
-		console.log("❌ No transactions to send");
-		return false;
-	}
-
-	console.log(`📤 Sending sell bundle with ${bundledTxns.length} transactions to Jito`);
-	console.log(`📏 Total bundle size: ${bundledTxns.reduce((sum, tx) => sum + tx.serialize().length, 0).toLocaleString()} bytes`);
-
-	try {
-		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
-		console.log(`✅ Sell bundle sent successfully!`);
-		
-		let bundleIdStr;
-		try {
-			bundleIdStr = bundleId?.toString() || 'unknown';
-		} catch {
-			bundleIdStr = 'unknown';
-		}
-		console.log(`🆔 Bundle ID: ${bundleIdStr}`);
-
-		console.log("⏳ Waiting for sell bundle result...");
-		await new Promise(resolve => setTimeout(resolve, 10000));
-		
-		console.log("🔍 Checking sell transaction status...");
-		const success = await verifySellSuccess(bundledTxns);
-		
-		if (success) {
-			console.log("🎉 SELL BUNDLE SUCCESSFUL!");
-			return true;
-		} else {
-			console.log("❌ Sell bundle verification failed");
-			return false;
-		}
-
-	} catch (error) {
-		const err = error as any;
-		console.error("❌ Jito sell bundle error:", err.message);
-
-		if (err?.message?.includes("Bundle Dropped, no connected leader up soon")) {
-			console.error("  → No Jito leader available - try again in a few seconds");
-		} else if (err?.message?.includes("Rate limit exceeded")) {
-			console.log("⚠️  Jito API rate limit hit - checking on-chain status...");
-			await new Promise(resolve => setTimeout(resolve, 5000));
-			const success = await verifySellSuccess(bundledTxns);
-			return success;
-		} else {
-			console.error("  → Unexpected error occurred");
-		}
-		
-		return false;
-	}
+// Token platform enum
+enum TokenPlatform {
+    PUMP_FUN = "pump.fun",
+    PUMPSWAP = "pumpswap"
 }
 
-async function verifySellSuccess(bundledTxns: VersionedTransaction[]): Promise<boolean> {
-	console.log("\n=== VERIFYING SELL SUCCESS ===");
-
-	try {
-		let successCount = 0;
-		let totalChecked = 0;
-		
-		for (let i = 0; i < Math.min(bundledTxns.length, 5); i++) {
-			const tx = bundledTxns[i];
-			const signature = bs58.encode(tx.signatures[0]);
-			
-			try {
-				const status = await connection.getSignatureStatus(signature, { 
-					searchTransactionHistory: true 
-				});
-				
-				totalChecked++;
-				
-				if (status.value?.confirmationStatus) {
-					const isSuccess = !status.value.err;
-					console.log(`${isSuccess ? '✅' : '❌'} TX ${i + 1}: ${status.value.confirmationStatus.toUpperCase()}${status.value.err ? ` (${JSON.stringify(status.value.err)})` : ''}`);
-					
-					if (isSuccess) {
-						successCount++;
-					}
-				} else {
-					console.log(`⏳ TX ${i + 1}: Not found yet`);
-				}
-			} catch (error) {
-				console.log(`⚠️  TX ${i + 1}: Status check failed`);
-			}
-		}
-		
-		if (successCount > 0) {
-			console.log(`\n🎉 SELL SUCCESS CONFIRMED!`);
-			console.log(`📊 Transaction status: ${successCount}/${totalChecked} confirmed successful`);
-			return true;
-		} else {
-			console.log("❌ No successful sell transactions found");
-			return false;
-		}
-		
-	} catch (error) {
-		console.error("❌ Sell verification failed:", error);
-		return false;
-	}
-}
-
-// ✅ NEW: Interface for wallets with token balances
 interface WalletWithTokens {
-	keypair: Keypair;
-	tokenBalance: number;
-	walletName: string;
+    keypair: Keypair;
+    tokenBalance: number;
+    walletName: string;
 }
 
-// ✅ NEW: Check ALL wallets on-chain for token balances
-async function getAllWalletsWithTokens(mintAddress: PublicKey): Promise<WalletWithTokens[]> {
-	console.log("\n=== SCANNING ALL WALLETS FOR TOKENS ===");
-	console.log(`🔍 Checking token: ${mintAddress.toBase58()}`);
-	
-	const walletsWithTokens: WalletWithTokens[] = [];
-	const keypairs = loadKeypairs();
-	
-	// Check dev wallet first
-	console.log("\n👤 Checking DEV WALLET...");
-	try {
-		const devTokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
-		const devBalance = await connection.getTokenAccountBalance(devTokenAccount);
-		const devTokens = Number(devBalance.value.amount);
-		
-		if (devTokens > 0) {
-			console.log(`✅ DEV WALLET: ${(devTokens / 1e6).toFixed(2)}M tokens`);
-			walletsWithTokens.push({
-				keypair: wallet,
-				tokenBalance: devTokens,
-				walletName: "DEV WALLET"
-			});
-		} else {
-			console.log(`⚠️  DEV WALLET: No tokens found`);
-		}
-	} catch (error) {
-		console.log(`⚠️  DEV WALLET: No token account found`);
-	}
-
-	// Check all 24 keypairs
-	console.log("\n👥 Checking ALL 24 WALLETS...");
-	for (let i = 0; i < keypairs.length; i++) {
-		const keypair = keypairs[i];
-		try {
-			const tokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, keypair.publicKey);
-			const balance = await connection.getTokenAccountBalance(tokenAccount);
-			const tokens = Number(balance.value.amount);
-			
-			if (tokens > 0) {
-				console.log(`✅ Wallet ${i + 1}: ${(tokens / 1e6).toFixed(2)}M tokens (${keypair.publicKey.toString().slice(0, 8)}...)`);
-				walletsWithTokens.push({
-					keypair: keypair,
-					tokenBalance: tokens,
-					walletName: `Wallet ${i + 1}`
-				});
-			} else {
-				console.log(`⚪ Wallet ${i + 1}: No tokens`);
-			}
-		} catch (error) {
-			console.log(`⚪ Wallet ${i + 1}: No token account`);
-		}
-	}
-
-	console.log(`\n📊 SCAN COMPLETE:`);
-	console.log(`   Total wallets with tokens: ${walletsWithTokens.length}`);
-	console.log(`   Total tokens found: ${(walletsWithTokens.reduce((sum, w) => sum + w.tokenBalance, 0) / 1e6).toFixed(2)}M`);
-
-	return walletsWithTokens;
+interface BundleResult {
+    bundleId: string | null;
+    sent: boolean;
+    verified: boolean;
+    bundleNumber: number;
 }
 
-// ✅ MAIN SELL FUNCTION - Using Pump.Fun IDL like buy transactions
-export async function sellXPercentagePF() {
-	console.log("🔥 PUMP.FUN SELL BUNDLER");
-	console.log("========================");
+// ✅ MAIN UNIFIED SELL FUNCTION
+export async function unifiedSellFunction(): Promise<void> {
+    console.log("🎯 UNIFIED SELL BUNDLER");
+    console.log("========================");
+    console.log("🔍 Auto-detects Pump.fun vs PumpSwap");
+    console.log("⚡ Smart Wallet Selection");
+    console.log("📦 Optimized Bundling Strategy");
 
-	try {
-		// Setup Anchor like jitoPool.ts
-		const provider = new anchor.AnchorProvider(
-			connection,
-			new anchor.Wallet(wallet),
-			{ commitment: "confirmed" }
-		);
+    try {
+        // Load token info
+        let poolInfo: { [key: string]: any } = {};
+        if (fs.existsSync(keyInfoPath)) {
+            const data = fs.readFileSync(keyInfoPath, "utf-8");
+            poolInfo = JSON.parse(data);
+        }
 
-		const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
-		const program = new anchor.Program(IDL_PumpFun, provider);
+        if (!poolInfo.addressLUT || !poolInfo.mintPk) {
+            console.log("❌ ERROR: Missing LUT or mint in keyInfo!");
+            return;
+        }
 
-		// Load keyInfo for LUT and mint
-		let poolInfo: { [key: string]: any } = {};
-		if (fs.existsSync(keyInfoPath)) {
-			const data = fs.readFileSync(keyInfoPath, "utf-8");
-			poolInfo = JSON.parse(data);
-		}
+        const lut = new PublicKey(poolInfo.addressLUT.toString());
+        const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+        if (!lookupTableAccount) {
+            console.log("❌ ERROR: Lookup table not found!");
+            return;
+        }
 
-		if (!poolInfo.addressLUT || !poolInfo.mintPk) {
-			console.log("❌ ERROR: Missing LUT or mint in keyInfo!");
-			return;
-		}
+        const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(poolInfo.mintPk)));
+        console.log(`🎯 Token: ${mintKp.publicKey.toBase58()}`);
 
-		const lut = new PublicKey(poolInfo.addressLUT.toString());
-		const lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+        // ✅ STEP 1: Auto-detect platform
+        console.log("\n🔍 DETECTING TOKEN PLATFORM...");
+        const platform = await detectTokenPlatform(mintKp.publicKey);
+        
+        if (platform === TokenPlatform.PUMP_FUN) {
+            console.log("✅ Platform: Pump.fun (Bonding Curve)");
+            console.log("🔗 View: https://pump.fun/" + mintKp.publicKey.toBase58());
+        } else if (platform === TokenPlatform.PUMPSWAP) {
+            console.log("✅ Platform: PumpSwap (Migrated/AMM)");
+            console.log("🔗 View: https://pumpswap.co/" + mintKp.publicKey.toBase58());
+        } else {
+            console.log("❌ ERROR: Token not found on Pump.fun or PumpSwap!");
+            return;
+        }
 
-		if (lookupTableAccount == null) {
-			console.log("❌ ERROR: Lookup table not found on-chain!");
-			return;
-		}
+        // ✅ STEP 2: Get user preferences
+        console.log(`\n🎯 WALLET SELECTION OPTIONS:`);
+        console.log(`1. Sell from ALL wallets (creator + bundle wallets)`);
+        console.log(`2. Sell from BUNDLE wallets only (exclude creator)`);
+        console.log(`3. Sell from CREATOR wallet only`);
+        
+        const selectionInput = prompt("Choose wallet selection mode (1/2/3): ");
+        const selectionMode = parseInt(selectionInput) as WalletSelectionMode || WalletSelectionMode.ALL_WALLETS;
 
-		const mintKp = Keypair.fromSecretKey(Uint8Array.from(bs58.decode(poolInfo.mintPk)));
-		console.log(`🎯 Token: ${mintKp.publicKey.toBase58()}`);
+        const supplyPercentInput = prompt("Percentage to sell (Ex. 1 for 1%, 100 for 100%): ");
+        const supplyPercentNum = parseFloat(supplyPercentInput?.replace('%', '') || '0');
+        if (isNaN(supplyPercentNum) || supplyPercentNum <= 0 || supplyPercentNum > 100) {
+            console.log("❌ Invalid percentage!");
+            return;
+        }
+        const supplyPercent = supplyPercentNum / 100;
 
-		// Get sell parameters
-		const supplyPercentInput = prompt("Percentage to sell (Ex. 1 for 1%, 100 for 100%): ");
-		const supplyPercentNum = parseFloat(supplyPercentInput.replace('%', ''));
-		
-		if (isNaN(supplyPercentNum) || supplyPercentNum <= 0 || supplyPercentNum > 100) {
-			console.log("❌ Invalid percentage! Must be between 0.01 and 100");
-			return;
-		}
-		
-		const supplyPercent = supplyPercentNum / 100;
-		const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
+        const slippageInput = prompt("Slippage tolerance % (default 10): ");
+        const slippagePercent = slippageInput ? parseFloat(slippageInput) : 10;
 
-		if (supplyPercent > 0.25) {
-			console.log("⚠️  WARNING: Selling more than 25% may cause high price impact!");
-			const proceed = prompt("Continue anyway? (y/n): ").toLowerCase();
-			if (proceed !== 'y') return;
-		}
+        const jitoTipInput = prompt("Jito tip in Sol (Ex. 0.01): ");
+        const jitoTipAmt = parseFloat(jitoTipInput || '0') * LAMPORTS_PER_SOL;
+        if (jitoTipAmt <= 0) {
+            console.log("❌ Invalid tip amount!");
+            return;
+        }
 
-		console.log(`📊 Selling ${(supplyPercent * 100).toFixed(2)}% of each wallet's tokens`);
+        const modeNames = {
+            [WalletSelectionMode.ALL_WALLETS]: "ALL WALLETS",
+            [WalletSelectionMode.BUNDLE_ONLY]: "BUNDLE WALLETS ONLY", 
+            [WalletSelectionMode.CREATOR_ONLY]: "CREATOR WALLET ONLY"
+        };
 
-		// ✅ Get ALL wallets with tokens by checking on-chain
-		const walletsWithTokens = await getAllWalletsWithTokens(mintKp.publicKey);
-		
-		if (walletsWithTokens.length === 0) {
-			console.log("❌ No wallets found with tokens!");
-			console.log("💡 Make sure this is the correct token address");
-			return;
-		}
+        console.log(`\n📊 SELL CONFIGURATION:`);
+        console.log(`   Platform: ${platform}`);
+        console.log(`   Mode: ${modeNames[selectionMode]}`);
+        console.log(`   Percentage: ${(supplyPercent * 100).toFixed(2)}%`);
+        console.log(`   Slippage: ${slippagePercent}%`);
+        console.log(`   Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
 
-		// ✅ Pre-calculate PDAs (same as jitoPool.ts)
-		const [bondingCurve] = PublicKey.findProgramAddressSync(
-			[Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()], 
-			PUMP_PROGRAM
-		);
-		const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-			[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintKp.publicKey.toBytes()],
-			spl.ASSOCIATED_TOKEN_PROGRAM_ID
-		);
-		const [creatorVault] = PublicKey.findProgramAddressSync(
-			[Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
-			PUMP_PROGRAM
-		);
+        // ✅ STEP 3: Execute appropriate sell function
+        if (platform === TokenPlatform.PUMP_FUN) {
+            await executePumpFunSell(
+                mintKp.publicKey, 
+                selectionMode, 
+                supplyPercent, 
+                slippagePercent, 
+                jitoTipAmt, 
+                lookupTableAccount
+            );
+        } else {
+            await executePumpSwapSell(
+                mintKp.publicKey, 
+                selectionMode, 
+                supplyPercent, 
+                slippagePercent, 
+                jitoTipAmt, 
+                lookupTableAccount
+            );
+        }
 
-		// ✅ Build individual sell transactions for each wallet
-		console.log("\n=== BUILDING SELL TRANSACTIONS ===");
-		const bundledTxns: VersionedTransaction[] = [];
-		const { blockhash } = await connection.getLatestBlockhash();
+    } catch (error) {
+        console.error("❌ Unified sell error:", error);
+    }
+}
 
-		for (let i = 0; i < walletsWithTokens.length; i++) {
-			const walletData = walletsWithTokens[i];
-			const isLastWallet = i === walletsWithTokens.length - 1;
-			
-			// Calculate sell amount
-			const sellAmount = Math.floor(walletData.tokenBalance * supplyPercent);
-			
-			if (sellAmount <= 0) {
-				console.log(`⏭️  ${walletData.walletName}: Skipping (${sellAmount} tokens)`);
-				continue;
-			}
+// ✅ Function to detect which platform the token is on
+async function detectTokenPlatform(mintAddress: PublicKey): Promise<TokenPlatform | null> {
+    try {
+        // Check if token has Pump.fun bonding curve
+        const [bondingCurve] = PublicKey.findProgramAddressSync(
+            [Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+            PUMP_PROGRAM
+        );
+        
+        const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
+        
+        if (bondingCurveInfo) {
+            // Parse bonding curve to check if complete (migrated)
+            const completeOffset = 8 + 8 + 8 + 8 + 8 + 8; // Skip to 'complete' field
+            const isComplete = bondingCurveInfo.data[completeOffset] === 1;
+            
+            if (isComplete) {
+                // Token migrated, check if PumpSwap pool exists
+                const pumpSwapPool = await findPumpSwapPool(mintAddress);
+                if (pumpSwapPool) {
+                    return TokenPlatform.PUMPSWAP;
+                }
+            } else {
+                // Token still on bonding curve
+                return TokenPlatform.PUMP_FUN;
+            }
+        }
+        
+        // If no bonding curve, check directly for PumpSwap pool
+        const pumpSwapPool = await findPumpSwapPool(mintAddress);
+        if (pumpSwapPool) {
+            return TokenPlatform.PUMPSWAP;
+        }
+        
+        return null;
+    } catch (error) {
+        console.error("Error detecting platform:", error);
+        return null;
+    }
+}
 
-			console.log(`🔨 Building sell TX for ${walletData.walletName}: ${(sellAmount / 1e6).toFixed(2)}M tokens`);
+// ✅ Find PumpSwap pool for token
+async function findPumpSwapPool(mintAddress: PublicKey): Promise<PublicKey | null> {
+    try {
+        const pools = await connection.getProgramAccounts(PUMPSWAP_PROGRAM_ID, {
+            filters: [
+                {
+                    memcmp: {
+                        offset: 0,
+                        bytes: bs58.encode([241, 154, 109, 4, 17, 177, 109, 188])
+                    }
+                },
+                {
+                    memcmp: {
+                        offset: 8 + 1 + 2 + 32,
+                        bytes: mintAddress.toBase58()
+                    }
+                }
+            ]
+        });
 
-			// Build sell instructions
-			const sellTxIxs: TransactionInstruction[] = [];
-			
-			// Compute budget
-			sellTxIxs.push(
-				ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
-				ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
-			);
+        return pools.length > 0 ? pools[0].pubkey : null;
+    } catch (error) {
+        return null;
+    }
+}
 
-			// Get wallet's token account
-			const walletTokenATA = spl.getAssociatedTokenAddressSync(mintKp.publicKey, walletData.keypair.publicKey);
+// ✅ Get wallets with tokens based on selection mode
+async function getAllWalletsWithTokens(mintAddress: PublicKey, selectionMode: WalletSelectionMode): Promise<WalletWithTokens[]> {
+    console.log("\n=== SCANNING WALLETS FOR TOKENS ===");
+    
+    const walletsWithTokens: WalletWithTokens[] = [];
+    const keypairs = loadKeypairs();
+    
+    // Check dev wallet (creator) if mode allows
+    if (selectionMode === WalletSelectionMode.ALL_WALLETS || selectionMode === WalletSelectionMode.CREATOR_ONLY) {
+        try {
+            const devTokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
+            const devBalance = await connection.getTokenAccountBalance(devTokenAccount);
+            const devTokens = Number(devBalance.value.amount);
+            
+            if (devTokens > 0) {
+                console.log(`✅ DEV WALLET (CREATOR): ${(devTokens / 1e6).toFixed(2)}M tokens`);
+                walletsWithTokens.push({
+                    keypair: wallet,
+                    tokenBalance: devTokens,
+                    walletName: "DEV WALLET (CREATOR)"
+                });
+            }
+        } catch (error) {
+            console.log(`⚠️  DEV WALLET: No token account found`);
+        }
+    }
 
-			// ✅ Use Pump.Fun sell instruction (same pattern as buy in jitoPool.ts)
-			const sellIx = await (program.methods as any)
-				.sell(new BN(sellAmount), new BN(0)) // sell amount, min SOL out (0 = no slippage protection)
-				.accounts({
-					global: globalAccount,
-					feeRecipient: feeRecipient,
-					mint: mintKp.publicKey,
-					bondingCurve: bondingCurve,
-					associatedBondingCurve: associatedBondingCurve,
-					associatedUser: walletTokenATA,
-					user: walletData.keypair.publicKey,
-					systemProgram: SystemProgram.programId,
-					creatorVault: creatorVault,
-					tokenProgram: spl.TOKEN_PROGRAM_ID,
-					eventAuthority: eventAuthority,
-					program: PUMP_PROGRAM,
-				})
-				.instruction();
+    // Check bundle wallets if mode allows  
+    if (selectionMode === WalletSelectionMode.ALL_WALLETS || selectionMode === WalletSelectionMode.BUNDLE_ONLY) {
+        for (let i = 0; i < keypairs.length; i++) {
+            const keypair = keypairs[i];
+            try {
+                const tokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, keypair.publicKey);
+                const balance = await connection.getTokenAccountBalance(tokenAccount);
+                const tokens = Number(balance.value.amount);
+                
+                if (tokens > 1000000) { // More than 1 token (6 decimals)
+                    console.log(`✅ Wallet ${i + 1} (BUNDLE): ${(tokens / 1e6).toFixed(2)}M tokens`);
+                    walletsWithTokens.push({
+                        keypair: keypair,
+                        tokenBalance: tokens,
+                        walletName: `Wallet ${i + 1} (BUNDLE)`
+                    });
+                }
+            } catch (error) {
+                // Silent - no token account
+            }
+        }
+    }
 
-			sellTxIxs.push(sellIx);
+    console.log(`📊 Found ${walletsWithTokens.length} wallets with tokens`);
+    return walletsWithTokens;
+}
 
-			// Add Jito tip to the last transaction
-			if (isLastWallet) {
-				console.log(`  💰 Adding Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
-				sellTxIxs.push(
-					SystemProgram.transfer({
-						fromPubkey: walletData.keypair.publicKey,
-						toPubkey: getRandomTipAccount(),
-						lamports: BigInt(jitoTipAmt),
-					})
-				);
-			}
+// ✅ PUMP.FUN SELL EXECUTION
+async function executePumpFunSell(
+    mintAddress: PublicKey,
+    selectionMode: WalletSelectionMode,
+    supplyPercent: number,
+    slippagePercent: number,
+    jitoTipAmt: number,
+    lookupTableAccount: any
+): Promise<void> {
+    console.log("\n🔄 EXECUTING PUMP.FUN SELL...");
+    
+    try {
+        // Setup Anchor
+        const provider = new anchor.AnchorProvider(
+            connection,
+            new anchor.Wallet(wallet),
+            { commitment: "confirmed" }
+        );
 
-			// Build transaction
-			const message = new TransactionMessage({
-				payerKey: walletData.keypair.publicKey,
-				recentBlockhash: blockhash,
-				instructions: sellTxIxs,
-			}).compileToV0Message([lookupTableAccount]);
+        const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
+        const program = new anchor.Program(IDL_PumpFun, provider);
 
-			const versionedTx = new VersionedTransaction(message);
+        // Get wallets with tokens
+        const walletsWithTokens = await getAllWalletsWithTokens(mintAddress, selectionMode);
+        if (walletsWithTokens.length === 0) {
+            console.log("❌ No wallets found with tokens!");
+            return;
+        }
 
-			// Size check
-			const txSize = versionedTx.serialize().length;
-			console.log(`  📏 Size: ${txSize}/1232 bytes`);
-			
-			if (txSize > 1232) {
-				console.log(`  ❌ Transaction too large, skipping ${walletData.walletName}`);
-				continue;
-			}
+        // Pre-calculate PDAs
+        const [bondingCurve] = PublicKey.findProgramAddressSync(
+            [Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+            PUMP_PROGRAM
+        );
+        const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+            [bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintAddress.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        const [creatorVault] = PublicKey.findProgramAddressSync(
+            [Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
+            PUMP_PROGRAM
+        );
 
-			// Sign transaction
-			versionedTx.sign([walletData.keypair]);
-			bundledTxns.push(versionedTx);
-			
-			console.log(`  ✅ ${walletData.walletName} sell TX built`);
-		}
+        // Build transactions
+        console.log("🔨 Building Pump.fun sell transactions...");
+        const bundledTxns: VersionedTransaction[] = [];
+        const { blockhash } = await connection.getLatestBlockhash();
 
-		if (bundledTxns.length === 0) {
-			console.log("❌ No valid sell transactions were built!");
-			return;
-		}
+        // Group wallets (5 per transaction for Pump.fun)
+        const WALLETS_PER_TX = 5;
+        const walletChunks: WalletWithTokens[][] = [];
+        for (let i = 0; i < walletsWithTokens.length; i += WALLETS_PER_TX) {
+            walletChunks.push(walletsWithTokens.slice(i, i + WALLETS_PER_TX));
+        }
 
-		// ✅ Show summary and confirm
-		console.log(`\n=== SELL BUNDLE SUMMARY ===`);
-		console.log(`📦 Transactions: ${bundledTxns.length}`);
-		console.log(`👥 Wallets selling: ${walletsWithTokens.length}`);
-		console.log(`📊 Percentage: ${(supplyPercent * 100).toFixed(2)}% per wallet`);
-		console.log(`💰 Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
-		
-		const confirm = prompt("\n🔥 EXECUTE SELL BUNDLE? (y/yes): ").toLowerCase();
-		if (confirm !== 'yes' && confirm !== 'y') {
-			console.log("Sell cancelled.");
-			return;
-		}
+        for (let chunkIndex = 0; chunkIndex < walletChunks.length; chunkIndex++) {
+            const chunk = walletChunks[chunkIndex];
+            const isLastChunk = chunkIndex === walletChunks.length - 1;
+            
+            const sellTxIxs: TransactionInstruction[] = [];
+            
+            // Compute budget for multiple sells
+            sellTxIxs.push(
+                ComputeBudgetProgram.setComputeUnitLimit({ units: 100000 + (chunk.length * 80000) }),
+                ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
+            );
 
-		// ✅ Send bundle
-		const success = await sendBundle(bundledTxns);
+            const signers: Keypair[] = [payer];
 
-		if (success) {
-			console.log("🎉 Sell completed successfully!");
-			console.log("💡 Check your wallets for received SOL");
-		} else {
-			console.log("❌ Sell bundle failed");
-		}
+            // Add sell instructions for each wallet
+            for (const walletData of chunk) {
+                const sellAmount = Math.floor(walletData.tokenBalance * supplyPercent);
+                if (sellAmount <= 0) continue;
 
-	} catch (error) {
-		console.error("❌ Sell function error:", error);
-	}
+                const walletTokenATA = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
+
+                const sellIx = await (program.methods as any)
+                    .sell(new BN(sellAmount), new BN(0)) // min SOL out = 0 (accept slippage)
+                    .accounts({
+                        global: globalAccount,
+                        feeRecipient: feeRecipient,
+                        mint: mintAddress,
+                        bondingCurve: bondingCurve,
+                        associatedBondingCurve: associatedBondingCurve,
+                        associatedUser: walletTokenATA,
+                        user: walletData.keypair.publicKey,
+                        systemProgram: SystemProgram.programId,
+                        creatorVault: creatorVault,
+                        tokenProgram: spl.TOKEN_PROGRAM_ID,
+                        eventAuthority: eventAuthority,
+                        program: PUMP_PROGRAM,
+                    })
+                    .instruction();
+
+                sellTxIxs.push(sellIx);
+                signers.push(walletData.keypair);
+
+                console.log(`  📤 ${walletData.walletName}: ${(sellAmount / 1e6).toFixed(2)}M tokens`);
+            }
+
+            // Add Jito tip to last transaction
+            if (isLastChunk) {
+                console.log(`  💰 Adding Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
+                sellTxIxs.push(
+                    SystemProgram.transfer({
+                        fromPubkey: payer.publicKey,
+                        toPubkey: getRandomTipAccount(),
+                        lamports: BigInt(jitoTipAmt),
+                    })
+                );
+            }
+
+            // Build transaction
+            const message = new TransactionMessage({
+                payerKey: payer.publicKey,
+                recentBlockhash: blockhash,
+                instructions: sellTxIxs,
+            }).compileToV0Message([lookupTableAccount]);
+
+            const versionedTx = new VersionedTransaction(message);
+            
+            const txSize = versionedTx.serialize().length;
+            console.log(`  📏 TX ${chunkIndex + 1} size: ${txSize}/1232 bytes`);
+            
+            if (txSize > 1232) {
+                console.log(`  ❌ Transaction ${chunkIndex + 1} too large, skipping`);
+                continue;
+            }
+
+            versionedTx.sign(signers);
+            bundledTxns.push(versionedTx);
+        }
+
+        if (bundledTxns.length === 0) {
+            console.log("❌ No valid transactions built!");
+            return;
+        }
+
+        // Send bundle
+        await sendBundleAndVerify([bundledTxns], "Pump.fun");
+
+    } catch (error) {
+        console.error("❌ Pump.fun sell error:", error);
+    }
+}
+
+// ✅ PUMPSWAP SELL EXECUTION  
+async function executePumpSwapSell(
+    mintAddress: PublicKey,
+    selectionMode: WalletSelectionMode,
+    supplyPercent: number,
+    slippagePercent: number,
+    jitoTipAmt: number,
+    lookupTableAccount: any
+): Promise<void> {
+    console.log("\n🔄 EXECUTING PUMPSWAP SELL...");
+    
+    try {
+        // Load PumpSwap IDL
+        const PUMPSWAP_IDL = JSON.parse(fs.readFileSync("./pumpswap-IDL.json", "utf-8"));
+        const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(wallet), { commitment: "confirmed" });
+        const program = new anchor.Program(PUMPSWAP_IDL as any, provider);
+
+        // Find pool
+        const poolAddress = await findPumpSwapPool(mintAddress);
+        if (!poolAddress) {
+            console.log("❌ ERROR: PumpSwap pool not found!");
+            return;
+        }
+        console.log(`✅ Pool: ${poolAddress.toBase58()}`);
+
+        // Get wallets with tokens
+        const walletsWithTokens = await getAllWalletsWithTokens(mintAddress, selectionMode);
+        if (walletsWithTokens.length === 0) {
+            console.log("❌ No wallets found with tokens!");
+            return;
+        }
+
+        // Create smart bundles (3 wallets per TX for PumpSwap)
+        const bundles = createSmartBundles(walletsWithTokens);
+        const allBundledTxns: VersionedTransaction[][] = [];
+
+        // Build all bundles
+        for (let bundleIndex = 0; bundleIndex < bundles.length; bundleIndex++) {
+            const bundleWallets = bundles[bundleIndex];
+            const bundleNumber = bundleIndex + 1;
+            
+            console.log(`\n🔨 BUILDING BUNDLE ${bundleNumber}: ${bundleWallets.length} wallets`);
+            
+            const bundledTxns: VersionedTransaction[] = [];
+            const { blockhash } = await connection.getLatestBlockhash();
+            
+            // Group wallets into transactions (3 wallets per tx)
+            const WALLETS_PER_TX = 3;
+            const walletChunks: WalletWithTokens[][] = [];
+            for (let i = 0; i < bundleWallets.length; i += WALLETS_PER_TX) {
+                walletChunks.push(bundleWallets.slice(i, i + WALLETS_PER_TX));
+            }
+
+            // Build each transaction
+            for (let txIndex = 0; txIndex < walletChunks.length; txIndex++) {
+                const walletChunk = walletChunks[txIndex];
+                const isLastTxInBundle = txIndex === walletChunks.length - 1;
+                
+                console.log(`  📝 TX ${txIndex + 1}: ${walletChunk.length} wallets${isLastTxInBundle ? ' + TIP' : ''}`);
+                
+                const sellData = await buildPumpSwapSellInstructions(
+                    program,
+                    walletChunk,
+                    mintAddress,
+                    poolAddress,
+                    supplyPercent,
+                    slippagePercent
+                );
+                
+                if (!sellData) {
+                    console.log(`    ❌ Failed to build TX ${txIndex + 1}`);
+                    continue;
+                }
+
+                const txInstructions = [
+                    ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 + (walletChunk.length * 150000) }),
+                    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
+                    ...sellData.instructions
+                ];
+
+                // Add Jito tip to last TX of each bundle
+                if (isLastTxInBundle) {
+                    console.log(`    💰 Adding Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
+                    txInstructions.push(
+                        SystemProgram.transfer({
+                            fromPubkey: sellData.payer,
+                            toPubkey: getRandomTipAccount(),
+                            lamports: BigInt(jitoTipAmt),
+                        })
+                    );
+                }
+
+                const message = new TransactionMessage({
+                    payerKey: sellData.payer,
+                    recentBlockhash: blockhash,
+                    instructions: txInstructions,
+                }).compileToV0Message([lookupTableAccount]);
+
+                const versionedTx = new VersionedTransaction(message);
+                const txSize = versionedTx.serialize().length;
+                
+                console.log(`    📏 Size: ${txSize}/1232 bytes`);
+                
+                if (txSize > 1232) {
+                    console.log(`    ❌ TX too large, skipping`);
+                    continue;
+                }
+
+                try {
+                    versionedTx.sign(sellData.signers);
+                    
+                    // Simulate transaction
+                    const simResult = await connection.simulateTransaction(versionedTx, {
+                        commitment: "processed",
+                        sigVerify: false,
+                        replaceRecentBlockhash: true
+                    });
+
+                    if (simResult.value.err) {
+                        console.log(`    ❌ Simulation failed:`, simResult.value.err);
+                        continue;
+                    }
+
+                    console.log(`    ✅ Simulation SUCCESS! CU: ${simResult.value.unitsConsumed?.toLocaleString()}`);
+                    bundledTxns.push(versionedTx);
+                    
+                } catch (error) {
+                    console.log(`    ❌ TX build error:`, error);
+                    continue;
+                }
+            }
+
+            if (bundledTxns.length > 0) {
+                allBundledTxns.push(bundledTxns);
+            }
+        }
+
+        if (allBundledTxns.length === 0) {
+            console.log("❌ No valid bundles were built!");
+            return;
+        }
+
+        // Send bundles
+        await sendBundleAndVerify(allBundledTxns, "PumpSwap");
+
+    } catch (error) {
+        console.error("❌ PumpSwap sell error:", error);
+    }
+}
+
+// ✅ Helper function to create smart bundles for PumpSwap
+function createSmartBundles(walletsWithTokens: WalletWithTokens[]): WalletWithTokens[][] {
+    const WALLETS_PER_TX = 3;
+    const MAX_SELLS_PER_BUNDLE = 15;
+    
+    if (walletsWithTokens.length <= MAX_SELLS_PER_BUNDLE) {
+        return [walletsWithTokens];
+    } else {
+        // Split into multiple bundles
+        const mid = Math.ceil(walletsWithTokens.length / 2);
+        return [
+            walletsWithTokens.slice(0, mid),
+            walletsWithTokens.slice(mid)
+        ];
+    }
+}
+
+// ✅ Helper function to build PumpSwap sell instructions
+async function buildPumpSwapSellInstructions(
+    program: anchor.Program,
+    walletsData: WalletWithTokens[],
+    mintAddress: PublicKey,
+    poolAddress: PublicKey,
+    supplyPercent: number,
+    slippagePercent: number
+): Promise<{
+    instructions: TransactionInstruction[];
+    payer: PublicKey;
+    signers: Keypair[];
+} | null> {
+    try {
+        const instructions: TransactionInstruction[] = [];
+        const signers: Keypair[] = [];
+        
+        // Get shared accounts
+        const coinCreator = await getPoolCoinCreator(poolAddress);
+        if (!coinCreator) return null;
+
+        const protocolFeeRecipients = await getProtocolFeeRecipients();
+        if (protocolFeeRecipients.length === 0) return null;
+        
+        const protocolFeeRecipient = protocolFeeRecipients[0];
+        const [protocolFeeRecipientTokenAccount] = PublicKey.findProgramAddressSync(
+            [protocolFeeRecipient.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+
+        // Shared PDAs
+        const [poolBaseTokenAccount] = PublicKey.findProgramAddressSync(
+            [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintAddress.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        const [poolQuoteTokenAccount] = PublicKey.findProgramAddressSync(
+            [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        const [coinCreatorVaultAuthority] = PublicKey.findProgramAddressSync(
+            [Buffer.from("creator_vault"), coinCreator.toBytes()],
+            PUMPSWAP_PROGRAM_ID
+        );
+        const [coinCreatorVaultAta] = PublicKey.findProgramAddressSync(
+            [coinCreatorVaultAuthority.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        const [eventAuthority] = PublicKey.findProgramAddressSync(
+            [Buffer.from("__event_authority")],
+            PUMPSWAP_PROGRAM_ID
+        );
+        const [globalConfig] = PublicKey.findProgramAddressSync(
+            [Buffer.from("global_config")],
+            PUMPSWAP_PROGRAM_ID
+        );
+
+        const payerWallet = walletsData[0].keypair;
+
+        // Build instructions for each wallet
+        for (const walletData of walletsData) {
+            const sellAmount = Math.floor(walletData.tokenBalance * supplyPercent);
+            
+            const expectedSolOutput = await getExpectedSolOutput(poolAddress, new BN(sellAmount), mintAddress);
+            const slippageFactor = new BN(100 - slippagePercent);
+            const minQuoteOut = expectedSolOutput.mul(slippageFactor).div(new BN(100));
+
+            const userBaseTokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
+            const userQuoteTokenAccount = spl.getAssociatedTokenAddressSync(WSOL_MINT, walletData.keypair.publicKey);
+
+            const createWSOLIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+                payerWallet.publicKey,
+                userQuoteTokenAccount,
+                walletData.keypair.publicKey,
+                WSOL_MINT
+            );
+            instructions.push(createWSOLIx);
+
+            const sellIx = await program.methods
+                .sell(new BN(sellAmount), minQuoteOut)
+                .accounts({
+                    pool: poolAddress,
+                    user: walletData.keypair.publicKey,
+                    globalConfig: globalConfig,
+                    baseMint: mintAddress,
+                    quoteMint: WSOL_MINT,
+                    userBaseTokenAccount: userBaseTokenAccount,
+                    userQuoteTokenAccount: userQuoteTokenAccount,
+                    poolBaseTokenAccount: poolBaseTokenAccount,
+                    poolQuoteTokenAccount: poolQuoteTokenAccount,
+                    protocolFeeRecipient: protocolFeeRecipient,
+                    protocolFeeRecipientTokenAccount: protocolFeeRecipientTokenAccount,
+                    baseTokenProgram: spl.TOKEN_PROGRAM_ID,
+                    quoteTokenProgram: spl.TOKEN_PROGRAM_ID,
+                    systemProgram: SystemProgram.programId,
+                    associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+                    eventAuthority: eventAuthority,
+                    program: PUMPSWAP_PROGRAM_ID,
+                    coinCreatorVaultAta: coinCreatorVaultAta,
+                    coinCreatorVaultAuthority: coinCreatorVaultAuthority,
+                })
+                .instruction();
+
+            instructions.push(sellIx);
+            
+            if (!walletData.keypair.publicKey.equals(payerWallet.publicKey)) {
+                signers.push(walletData.keypair);
+            }
+
+            console.log(`      📤 ${walletData.walletName}: ${(sellAmount / 1e6).toFixed(2)}M tokens`);
+        }
+
+        signers.unshift(payerWallet);
+        
+        return { instructions, payer: payerWallet.publicKey, signers };
+
+    } catch (error) {
+        console.error("❌ Error building PumpSwap sell instructions:", error);
+        return null;
+    }
+}
+
+// ✅ Helper functions for PumpSwap
+async function getExpectedSolOutput(poolAddress: PublicKey, sellTokenAmount: BN, baseMint: PublicKey): Promise<BN> {
+    try {
+        const poolBaseTokenAccount = PublicKey.findProgramAddressSync(
+            [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), baseMint.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        )[0];
+        
+        const poolQuoteTokenAccount = PublicKey.findProgramAddressSync(
+            [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
+            spl.ASSOCIATED_TOKEN_PROGRAM_ID
+        )[0];
+
+        const baseReserveInfo = await connection.getTokenAccountBalance(poolBaseTokenAccount);
+        const quoteReserveInfo = await connection.getTokenAccountBalance(poolQuoteTokenAccount);
+        
+        const baseReserve = new BN(baseReserveInfo.value.amount);
+        const quoteReserve = new BN(quoteReserveInfo.value.amount);
+
+        const k = baseReserve.mul(quoteReserve);
+        const newBaseReserve = baseReserve.add(sellTokenAmount);
+        const newQuoteReserve = k.div(newBaseReserve);
+        const expectedSolOutput = quoteReserve.sub(newQuoteReserve);
+        
+        return expectedSolOutput;
+        
+    } catch (error) {
+        return new BN(Math.floor(sellTokenAmount.toNumber() * 0.000001)); 
+    }
+}
+
+async function getProtocolFeeRecipients(): Promise<PublicKey[]> {
+    try {
+        const [globalConfig] = PublicKey.findProgramAddressSync(
+            [Buffer.from("global_config")],
+            PUMPSWAP_PROGRAM_ID
+        );
+
+        const globalConfigInfo = await connection.getAccountInfo(globalConfig);
+        if (!globalConfigInfo) return [];
+
+        const data = globalConfigInfo.data;
+        const protocolFeeRecipientsOffset = 8 + 32 + 8 + 8 + 1; 
+        const protocolFeeRecipients: PublicKey[] = [];
+        
+        for (let i = 0; i < 8; i++) {
+            const recipientOffset = protocolFeeRecipientsOffset + (i * 32);
+            const recipientBytes = data.slice(recipientOffset, recipientOffset + 32);
+            const recipient = new PublicKey(recipientBytes);
+            
+            if (!recipient.equals(PublicKey.default)) {
+                protocolFeeRecipients.push(recipient);
+            }
+        }
+        
+        return protocolFeeRecipients;
+        
+    } catch (error) {
+        return [];
+    }
+}
+
+async function getPoolCoinCreator(poolAddress: PublicKey): Promise<PublicKey | null> {
+    try {
+        const poolAccountInfo = await connection.getAccountInfo(poolAddress);
+        if (!poolAccountInfo) return null;
+
+        const coinCreatorOffset = 8 + 1 + 2 + 32 + 32 + 32 + 32 + 32 + 32 + 8;
+        const coinCreatorBytes = poolAccountInfo.data.slice(coinCreatorOffset, coinCreatorOffset + 32);
+        
+        return new PublicKey(coinCreatorBytes);
+    } catch (error) {
+        return null;
+    }
+}
+
+// ✅ Send bundle and verify results
+async function sendBundleAndVerify(bundlesList: VersionedTransaction[][], platform: string): Promise<void> {
+    console.log(`\n🚀 SENDING ${bundlesList.length} BUNDLE(S) TO JITO`);
+    
+    try {
+        if (bundlesList.length === 1) {
+            // Single bundle
+            const bundledTxns = bundlesList[0];
+            console.log(`📤 Sending ${platform} bundle: ${bundledTxns.length} transactions`);
+            
+            const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
+            console.log(`✅ Bundle sent! ID: ${bundleId}`);
+            
+            // Show transaction signatures
+            console.log(`📋 Transaction signatures:`);
+            for (let i = 0; i < bundledTxns.length; i++) {
+                const signature = bs58.encode(bundledTxns[i].signatures[0]);
+                console.log(`   TX ${i + 1}: https://solscan.io/tx/${signature}`);
+            }
+            
+            // Wait and verify
+            console.log("⏳ Waiting 10 seconds for bundle processing...");
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            
+            const success = await verifyBundleManually(bundledTxns, 1);
+            console.log(`\n🎉 ${platform} SELL ${success ? 'SUCCESSFUL' : 'FAILED'}!`);
+            
+        } else {
+            // Multiple bundles - send simultaneously
+            const bundlePromises = bundlesList.map(async (bundledTxns, index) => {
+                const bundleNumber = index + 1;
+                console.log(`📤 Queueing Bundle ${bundleNumber}: ${bundledTxns.length} transactions`);
+                
+                try {
+                    const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
+                    console.log(`✅ Bundle ${bundleNumber} sent! ID: ${bundleId}`);
+                    return { bundleNumber, success: true, bundledTxns };
+                } catch (error) {
+                    console.error(`❌ Bundle ${bundleNumber} failed:`, error);
+                    return { bundleNumber, success: false, bundledTxns };
+                }
+            });
+            
+            const results = await Promise.allSettled(bundlePromises);
+            
+            // Wait and verify all bundles
+            console.log("⏳ Waiting 10 seconds for bundle processing...");
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            
+            let successCount = 0;
+            for (const result of results) {
+                if (result.status === 'fulfilled' && result.value.success) {
+                    const verified = await verifyBundleManually(result.value.bundledTxns, result.value.bundleNumber);
+                    if (verified) successCount++;
+                }
+            }
+            
+            console.log(`\n🎉 ${platform} SELL RESULTS: ${successCount}/${bundlesList.length} bundles successful!`);
+        }
+        
+    } catch (error) {
+        console.error(`❌ ${platform} bundle error:`, error);
+    }
+}
+
+// ✅ Verify bundle manually via signature checks
+async function verifyBundleManually(bundledTxns: VersionedTransaction[], bundleNumber: number): Promise<boolean> {
+    try {
+        console.log(`🔍 Verifying Bundle ${bundleNumber}...`);
+        
+        let successCount = 0;
+        
+        for (let i = 0; i < bundledTxns.length; i++) {
+            const signature = bs58.encode(bundledTxns[i].signatures[0]);
+            
+            try {
+                const status = await connection.getSignatureStatus(signature, { 
+                    searchTransactionHistory: true 
+                });
+                
+                if (status.value?.confirmationStatus && !status.value.err) {
+                    console.log(`✅ Bundle ${bundleNumber} TX ${i + 1}: CONFIRMED`);
+                    console.log(`    🔗 https://solscan.io/tx/${signature}`);
+                    successCount++;
+                } else if (status.value?.err) {
+                    console.log(`❌ Bundle ${bundleNumber} TX ${i + 1}: FAILED`);
+                } else {
+                    console.log(`⏳ Bundle ${bundleNumber} TX ${i + 1}: PENDING`);
+                }
+            } catch (error) {
+                console.log(`⚠️  Bundle ${bundleNumber} TX ${i + 1}: Status check failed`);
+            }
+        }
+        
+        return successCount > 0;
+        
+    } catch (error) {
+        console.error(`❌ Bundle ${bundleNumber} verification error:`, error);
+        return false;
+    }
 }

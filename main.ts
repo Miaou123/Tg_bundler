@@ -1,10 +1,10 @@
 import { createKeypairs } from "./src/createKeys";
 import { buyBundle } from "./src/jitoPool";
 import { sender } from "./src/senderUI";
-import { sellXPercentagePF } from "./src/sellFunc";
-import { sellXPercentagePUMPSWAP } from "./src/sellPumpSwap";
+import { unifiedSellFunction } from "./src/sellFunc";
 import { sellAllTokensAndCleanup } from "./src/sellall";
 import { exportAllWallets, checkAllWalletBalances } from "./src/exportWallets";
+import { unifiedBuyFunction } from "./src/buyFunc";
 import { generateVanityAddress, generateMultipleVanityAddresses, calculateVanityDifficulty } from "./src/vanity";
 const promptSync = require("prompt-sync");
 
@@ -18,8 +18,8 @@ async function main() {
 		console.log("1. Create Keypairs");
 		console.log("2. Pre Launch Checklist");
 		console.log("3. Create Pool Bundle");
-		console.log("4. Sell % of Supply on Pump.Fun");
-		console.log("5. Sell % of Supply on PumpSwap");
+		console.log("4. Sell % of Supply on Pump.Fun or PumpSwap");
+		console.log("5. Buy % of Supply on Pump.Fun or PumpSwap");
 		console.log("6. 🧹 CLEANUP - Sell ALL tokens & return SOL");
 		console.log("7. 📋 EXPORT - All wallet keys for manual access");
 		console.log("8. 💰 CHECK - Quick balance check all wallets");
@@ -41,10 +41,10 @@ async function main() {
 				await buyBundle();
 				break;
 			case "4":
-				await sellXPercentagePF();
+				await unifiedSellFunction();
 				break;
-			case "5":
-				await sellXPercentagePUMPSWAP();
+			case "5": 
+				await unifiedBuyFunction();
 				break;
 			case "6":
 				await sellAllTokensAndCleanup();
