@@ -2,11 +2,11 @@ import { createKeypairs } from "./src/createKeys";
 import { buyBundle } from "./src/jitoPool";
 import { sender } from "./src/senderUI";
 import { sellXPercentagePF } from "./src/sellFunc";
+import { sellXPercentagePUMPSWAP } from "./src/sellPumpSwap";
 import { sellAllTokensAndCleanup } from "./src/sellall";
 import { exportAllWallets, checkAllWalletBalances } from "./src/exportWallets";
 import { generateVanityAddress, generateMultipleVanityAddresses, calculateVanityDifficulty } from "./src/vanity";
 const promptSync = require("prompt-sync");
-import { sellXPercentageRAY } from "./src/sellRay";
 
 const prompt = promptSync();
 
@@ -14,15 +14,12 @@ async function main() {
 	let running = true;
 
 	while (running) {
-		console.log("DM me for support");
-		console.log("https://t.me/benorizz0");
-		console.log("solana-scripts.com");
 		console.log("\nMenu:");
 		console.log("1. Create Keypairs");
 		console.log("2. Pre Launch Checklist");
 		console.log("3. Create Pool Bundle");
 		console.log("4. Sell % of Supply on Pump.Fun");
-		console.log("5. Sell % of Supply on Raydium");
+		console.log("5. Sell % of Supply on PumpSwap");
 		console.log("6. 🧹 CLEANUP - Sell ALL tokens & return SOL");
 		console.log("7. 📋 EXPORT - All wallet keys for manual access");
 		console.log("8. 💰 CHECK - Quick balance check all wallets");
@@ -47,7 +44,7 @@ async function main() {
 				await sellXPercentagePF();
 				break;
 			case "5":
-				await sellXPercentageRAY();
+				await sellXPercentagePUMPSWAP();
 				break;
 			case "6":
 				await sellAllTokensAndCleanup();

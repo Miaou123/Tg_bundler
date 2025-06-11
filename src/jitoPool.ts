@@ -120,36 +120,64 @@ export async function buyBundle() {
         return;
     }
 
-    // ✅ STEP 6: Plan bundle strategy
-    console.log("\n=== BUNDLE STRATEGY ===");
-    const walletsPerTx = 4; // 4 wallets per transaction (safe for compute budget)
-    const walletChunks = chunkArray(validWallets, walletsPerTx);
+     // ✅ STEP 6: Plan bundle strategy - UPDATED
+     console.log("\n=== BUNDLE STRATEGY ===");
     
-    // Check if dev wallet has buy configured
-    const devInfo = keyInfo[wallet.publicKey.toString()];
-    const devHasBuy = devInfo && devInfo.solAmount && parseFloat(devInfo.solAmount) > 0;
-    
-    const totalTxs = (devHasBuy ? 2 : 1) + walletChunks.length; // CREATE + DEV BUY (if configured) + wallet chunks
-    
-    console.log(`📊 Bundle Plan:`);
-    console.log(`  • TX 1: CREATE TOKEN`);
-    if (devHasBuy) {
-        console.log(`  • TX 2: DEV BUY`);
-    }
-    for (let i = 0; i < walletChunks.length; i++) {
-        const isLast = i === walletChunks.length - 1;
-        const tipNote = isLast ? " + JITO TIP" : "";
-        const txNum = (devHasBuy ? 3 : 2) + i;
-        console.log(`  • TX ${txNum}: Wallets ${i * walletsPerTx + 1}-${Math.min((i + 1) * walletsPerTx, validWallets.length)}${tipNote}`);
-    }
-    console.log(`  • Total: ${totalTxs} transactions`);
-    console.log(`  • Wallets: ${validWallets.length} buying simultaneously`);
-
-    if (totalTxs > 5) {
-        console.log(`⚠️  WARNING: ${totalTxs} transactions in bundle (max recommended: 5)`);
-        const proceed = prompt("Continue anyway? (y/n): ").toLowerCase();
-        if (proceed !== 'y') return;
-    }
+     // Check if dev wallet has buy configured
+     const devInfo = keyInfo[wallet.publicKey.toString()];
+     const devHasBuy = devInfo && devInfo.solAmount && parseFloat(devInfo.solAmount) > 0;
+     
+     console.log(`📊 OPTIMIZED Bundle Plan:`);
+     console.log(`  • TX 1: CREATE TOKEN`);
+     
+     if (devHasBuy && validWallets.length >= 4) {
+         console.log(`  • TX 2: DEV BUY + Wallets 1-4 (5 operations)`);
+         const remainingWallets = validWallets.length - 4;
+         const walletChunks = Math.ceil(remainingWallets / 5);
+         
+         for (let i = 0; i < walletChunks; i++) {
+             const startWallet = 5 + (i * 5);
+             const endWallet = Math.min(startWallet + 4, validWallets.length);
+             const isLast = i === walletChunks - 1;
+             console.log(`  • TX ${3 + i}: Wallets ${startWallet}-${endWallet}${isLast ? ' + JITO TIP' : ''}`);
+         }
+         
+         const totalTxs = 2 + walletChunks;
+         const totalBuys = 1 + validWallets.length; // dev buy + all wallets
+         
+         console.log(`  • Total: ${totalTxs} transactions, ${totalBuys} buying operations`);
+         console.log(`  🎯 Target: Up to 24 wallet buys + dev buy = 25 total operations`);
+         
+     } else if (devHasBuy) {
+         console.log(`  • TX 2: DEV BUY`);
+         const walletChunks = Math.ceil(validWallets.length / 5);
+         
+         for (let i = 0; i < walletChunks; i++) {
+             const startWallet = 1 + (i * 5);
+             const endWallet = Math.min(startWallet + 4, validWallets.length);
+             const isLast = i === walletChunks - 1;
+             console.log(`  • TX ${3 + i}: Wallets ${startWallet}-${endWallet}${isLast ? ' + JITO TIP' : ''}`);
+         }
+         
+     } else {
+         const walletChunks = Math.ceil(validWallets.length / 5);
+         
+         for (let i = 0; i < walletChunks; i++) {
+             const startWallet = 1 + (i * 5);
+             const endWallet = Math.min(startWallet + 4, validWallets.length);
+             const isLast = i === walletChunks - 1;
+             console.log(`  • TX ${2 + i}: Wallets ${startWallet}-${endWallet}${isLast ? ' + JITO TIP' : ''}`);
+         }
+     }
+ 
+     const totalTxs = 1 + (devHasBuy ? 1 : 0) + Math.ceil(validWallets.length / 5);
+     console.log(`  • Wallets: ${validWallets.length} buying simultaneously`);
+ 
+     if (totalTxs > 5) {
+         console.log(`⚠️  WARNING: ${totalTxs} transactions in bundle (max recommended: 5)`);
+         const proceed = prompt("Continue anyway? (y/n): ").toLowerCase();
+         if (proceed !== 'y') return;
+     }
 
     // ✅ STEP 7: Build all transactions
     console.log("\n=== BUILDING TRANSACTIONS ===");
@@ -220,18 +248,16 @@ async function buildMultiTransactionBundle(
     const devInfo = keyInfo[wallet.publicKey.toString()];
     const devHasBuy = devInfo && devInfo.solAmount && parseFloat(devInfo.solAmount) > 0;
 
-    console.log("🔨 Building TX 1: CREATE TOKEN");
+    console.log("🔨 Building TX 1: CREATE TOKEN ONLY");
     
-    // ✅ TRANSACTION 1: CREATE ONLY (no dev buy)
+    // ✅ TRANSACTION 1: CREATE ONLY 
     const createTxIxs: TransactionInstruction[] = [];
     
-    // Compute budget for CREATE transaction - increased for safety
     createTxIxs.push(
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }), // Increased from 400k
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200000 }) // Higher priority
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 }),
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200000 })
     );
 
-    // Create instruction only
     const createIx = await (program.methods as any)
         .create(name, symbol, metadata_uri, wallet.publicKey)
         .accounts({
@@ -254,7 +280,6 @@ async function buildMultiTransactionBundle(
 
     createTxIxs.push(createIx);
 
-    // Build CREATE transaction
     const createMessage = new TransactionMessage({
         payerKey: wallet.publicKey,
         instructions: createTxIxs,
@@ -263,7 +288,6 @@ async function buildMultiTransactionBundle(
 
     const createTx = new VersionedTransaction(createMessage);
     
-    // Size and simulation check
     const createSize = createTx.serialize().length;
     console.log(`  📏 Size: ${createSize}/1232 bytes`);
     
@@ -274,7 +298,6 @@ async function buildMultiTransactionBundle(
 
     createTx.sign([wallet, mintKp]);
 
-    // Simulate CREATE transaction
     console.log(`  🧪 Simulating CREATE transaction...`);
     try {
         const result = await connection.simulateTransaction(createTx, { 
@@ -296,48 +319,135 @@ async function buildMultiTransactionBundle(
 
     allTxs.push(createTx);
 
-    // ✅ TRANSACTION 2: DEV BUY (if configured)
-    if (devHasBuy) {
-        console.log("🔨 Building TX 2: DEV BUY");
+    // ✅ TRANSACTION 2: DEV BUY + 4 WALLETS (if dev buy configured)
+    let walletStartIndex = 0;
+    
+    if (devHasBuy && validWallets.length >= 4) {
+        console.log("🔨 Building TX 2: DEV BUY + 4 WALLETS");
         
-        const devBuyTxIxs: TransactionInstruction[] = [];
+        const devBuyAndWalletsTxIxs: TransactionInstruction[] = [];
         
-        // Compute budget for DEV BUY
-        devBuyTxIxs.push(
-            ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
+        // Higher compute budget for DEV BUY + 4 wallets
+        devBuyAndWalletsTxIxs.push(
+            ComputeBudgetProgram.setComputeUnitLimit({ units: 700000 }), // DEV BUY (300k) + 4 wallets (4×80k) + buffer
             ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
         );
 
         console.log(`  💰 Dev buy: ${devInfo.solAmount} SOL`);
         
+        // DEV BUY instructions
         const devAta = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
-        
         const devAtaIx = spl.createAssociatedTokenAccountIdempotentInstruction(
             wallet.publicKey, devAta, wallet.publicKey, mintKp.publicKey
         );
-        
-        // 🐛 ADD DEBUG LOGS FOR DEV WALLET
-        console.log(`🐛 RAW DEBUG - DEV BUY:`);
-        console.log(`  devInfo.tokenAmount (raw): "${devInfo.tokenAmount}"`);
-        console.log(`  devInfo.tokenAmount type: ${typeof devInfo.tokenAmount}`);
-        console.log(`  devInfo.solAmount (raw): "${devInfo.solAmount}"`);
-        console.log(`  devInfo.solAmount type: ${typeof devInfo.solAmount}`);
 
         const expectedTokens = new BN(devInfo.tokenAmount);
         const minTokens = expectedTokens.muln(90).divn(100);
-        
-        console.log(`  🔧 FIXED - minTokens (base units): ${minTokens.toString()}`);
-        console.log(`  🔧 FIXED - minTokens human: ${minTokens.toNumber()}M tokens`);
-        
         const devSolAmount = new BN(Math.floor(parseFloat(devInfo.solAmount) * LAMPORTS_PER_SOL));
-        console.log(`  devSolAmount BN: ${devSolAmount.toString()}`);
-        console.log(`  devSolAmount (SOL): ${devSolAmount.toNumber() / LAMPORTS_PER_SOL}`);
         
-        // Test BN conversion
-        console.log(`  🧪 BN test - should be 1000000: ${new BN("1000000").toString()}`);
-        console.log(`  🧪 BN test - large number: ${new BN("262168765743074").toString()}`);
+        const devBuyIx = await (program.methods as any)
+            .buy(minTokens, devSolAmount)
+            .accounts({
+                global: globalAccount,
+                feeRecipient: feeRecipient,
+                mint: mintKp.publicKey,
+                bondingCurve: bondingCurve,
+                associatedBondingCurve: associatedBondingCurve,
+                associatedUser: devAta,
+                user: wallet.publicKey,
+                systemProgram: SystemProgram.programId,
+                tokenProgram: spl.TOKEN_PROGRAM_ID,
+                creatorVault: creatorVault,
+                eventAuthority: eventAuthority,
+                program: PUMP_PROGRAM,
+            })
+            .instruction();
+
+        devBuyAndWalletsTxIxs.push(devAtaIx, devBuyIx);
+
+        // Add first 4 wallets to this transaction
+        const firstFourWallets = validWallets.slice(0, 4);
+        walletStartIndex = 4; // Start remaining wallets from index 4
+
+        for (const { keypair, amount, solAmount, index } of firstFourWallets) {
+            console.log(`    👤 Wallet ${index}: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
+            
+            const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, keypair.publicKey);
+            const keypairInfo = keyInfo[keypair.publicKey.toString()];
+            
+            if (!keypairInfo) continue;
+
+            const expectedTokens = new BN(keypairInfo.tokenAmount);
+            const minTokens = expectedTokens.muln(90).divn(100);
+            
+            const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+                keypair.publicKey, ata, keypair.publicKey, mintKp.publicKey
+            );
+            
+            const buyIx = await (program.methods as any)
+                .buy(minTokens, solAmount)
+                .accounts({
+                    global: globalAccount,
+                    feeRecipient: feeRecipient,
+                    mint: mintKp.publicKey,
+                    bondingCurve: bondingCurve,
+                    associatedBondingCurve: associatedBondingCurve,
+                    associatedUser: ata,
+                    user: keypair.publicKey,
+                    systemProgram: SystemProgram.programId,
+                    tokenProgram: spl.TOKEN_PROGRAM_ID,
+                    creatorVault: creatorVault,
+                    eventAuthority: eventAuthority,
+                    program: PUMP_PROGRAM,
+                })
+                .instruction();
+            
+            devBuyAndWalletsTxIxs.push(ataIx, buyIx);
+        }
+
+        // Build DEV BUY + 4 wallets transaction
+        const devBuyMessage = new TransactionMessage({
+            payerKey: payer.publicKey, // Use payer for wallet transactions
+            instructions: devBuyAndWalletsTxIxs,
+            recentBlockhash: blockhash,
+        }).compileToV0Message([lookupTableAccount]);
+
+        const devBuyTx = new VersionedTransaction(devBuyMessage);
         
-        console.log(`  Expected: ${expectedTokens.toNumber() / 1e6}M tokens, Min: ${minTokens.toNumber()}M tokens`);
+        const devBuySize = devBuyTx.serialize().length;
+        console.log(`  📏 Size: ${devBuySize}/1232 bytes`);
+        
+        if (devBuySize > 1232) {
+            console.log(`  ❌ DEV BUY + wallets transaction too large: ${devBuySize} bytes`);
+            return [];
+        }
+
+        // Sign with wallet (for dev buy) + payer + first 4 wallet keypairs
+        const devBuySigners = [wallet, payer, ...firstFourWallets.map(w => w.keypair)];
+        devBuyTx.sign(devBuySigners);
+
+        console.log(`  ✅ DEV BUY + 4 wallets transaction built (5 operations total)`);
+        allTxs.push(devBuyTx);
+
+    } else if (devHasBuy) {
+        // If dev buy configured but not enough wallets, do dev buy alone
+        console.log("🔨 Building TX 2: DEV BUY ONLY (not enough wallets for combined TX)");
+        
+        const devBuyTxIxs: TransactionInstruction[] = [];
+        
+        devBuyTxIxs.push(
+            ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
+        );
+
+        const devAta = spl.getAssociatedTokenAddressSync(mintKp.publicKey, wallet.publicKey);
+        const devAtaIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+            wallet.publicKey, devAta, wallet.publicKey, mintKp.publicKey
+        );
+
+        const expectedTokens = new BN(devInfo.tokenAmount);
+        const minTokens = expectedTokens.muln(90).divn(100);
+        const devSolAmount = new BN(Math.floor(parseFloat(devInfo.solAmount) * LAMPORTS_PER_SOL));
         
         const devBuyIx = await (program.methods as any)
             .buy(minTokens, devSolAmount)
@@ -359,7 +469,6 @@ async function buildMultiTransactionBundle(
 
         devBuyTxIxs.push(devAtaIx, devBuyIx);
 
-        // Build DEV BUY transaction
         const devBuyMessage = new TransactionMessage({
             payerKey: wallet.publicKey,
             instructions: devBuyTxIxs,
@@ -367,40 +476,27 @@ async function buildMultiTransactionBundle(
         }).compileToV0Message([lookupTableAccount]);
 
         const devBuyTx = new VersionedTransaction(devBuyMessage);
-        
-        // Size check
-        const devBuySize = devBuyTx.serialize().length;
-        console.log(`  📏 Size: ${devBuySize}/1232 bytes`);
-        
-        if (devBuySize > 1232) {
-            console.log(`  ❌ DEV BUY transaction too large: ${devBuySize} bytes`);
-            return [];
-        }
-
         devBuyTx.sign([wallet]);
-
-        // Skip simulation for DEV BUY (depends on CREATE)
-        console.log(`  ✅ DEV BUY transaction built (skipping simulation - depends on CREATE)`);
-
+        
+        console.log(`  ✅ DEV BUY transaction built`);
         allTxs.push(devBuyTx);
-    } else {
-        console.log("  ℹ️  No dev buy configured, skipping DEV BUY transaction");
     }
 
-    // ✅ WALLET BUY TRANSACTIONS
-    const walletsPerTx = 4;
-    const walletChunks = chunkArray(validWallets, walletsPerTx);
+    // ✅ REMAINING WALLET TRANSACTIONS: 5 wallets each
+    const remainingWallets = validWallets.slice(walletStartIndex);
+    const walletsPerTx = 5; // Now doing 5 wallets per transaction
+    const walletChunks = chunkArray(remainingWallets, walletsPerTx);
 
     for (let chunkIndex = 0; chunkIndex < walletChunks.length; chunkIndex++) {
         const chunk = walletChunks[chunkIndex];
         const isLastChunk = chunkIndex === walletChunks.length - 1;
-        const txNumber = (devHasBuy ? 3 : 2) + chunkIndex;
+        const txNumber = allTxs.length + 1; // Dynamic TX number based on current transactions
         
-        console.log(`🔨 Building TX ${txNumber}: Wallets ${chunk[0].index}-${chunk[chunk.length - 1].index}${isLastChunk ? ' + TIP' : ''}`);
+        console.log(`🔨 Building TX ${txNumber}: ${chunk.length} Wallets${isLastChunk ? ' + TIP' : ''}`);
 
         const walletTxIxs: TransactionInstruction[] = [];
         
-        // Compute budget for wallet transaction
+        // Compute budget for 5 wallets
         const walletCU = 100000 + (chunk.length * 80000); // Base + per wallet
         walletTxIxs.push(
             ComputeBudgetProgram.setComputeUnitLimit({ units: walletCU }),
@@ -412,41 +508,20 @@ async function buildMultiTransactionBundle(
             console.log(`    👤 Wallet ${index}: ${solAmount.toNumber() / LAMPORTS_PER_SOL} SOL`);
             
             const ata = spl.getAssociatedTokenAddressSync(mintKp.publicKey, keypair.publicKey);
-            
-            // ATA creation (idempotent)
-            const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
-                keypair.publicKey, ata, keypair.publicKey, mintKp.publicKey
-            );
-            
-            // Calculate reasonable minimum tokens (about 90% of expected amount)
             const keypairInfo = keyInfo[keypair.publicKey.toString()];
+            
             if (!keypairInfo) {
                 console.log(`    ⚠️  No key info for wallet ${index}`);
                 continue;
             }
 
-            // 🐛 ADD DEBUG LOGS FOR WALLET BUYS (only for first wallet in first chunk to avoid spam)
-            if (chunkIndex === 0 && index === chunk[0].index) {
-                console.log(`    🐛 WALLET DEBUG - Wallet ${index}:`);
-                console.log(`      keypairInfo.tokenAmount (raw): "${keypairInfo.tokenAmount}"`);
-                console.log(`      keypairInfo.tokenAmount type: ${typeof keypairInfo.tokenAmount}`);
-                console.log(`      keypairInfo.solAmount (raw): "${keypairInfo.solAmount}"`);
-                console.log(`      keypairInfo.solAmount type: ${typeof keypairInfo.solAmount}`);
-            }
-
             const expectedTokens = new BN(keypairInfo.tokenAmount);
-            const minTokens = expectedTokens.muln(90).divn(100); 
+            const minTokens = expectedTokens.muln(90).divn(100);
             
-            if (chunkIndex === 0 && index === chunk[0].index) {
-                console.log(`      expectedTokens BN: ${expectedTokens.toString()}`);
-                console.log(`      expectedTokens human: ${expectedTokens.toNumber() / 1e6}M tokens`);
-                console.log(`      🔧 FIXED - minTokens (base units): ${minTokens.toString()}`);
-                console.log(`      🔧 FIXED - minTokens human: ${minTokens.toNumber()}M tokens`);
-                console.log(`      solAmount BN: ${solAmount.toString()}`);
-                console.log(`      solAmount (SOL): ${solAmount.toNumber() / LAMPORTS_PER_SOL}`);
-            }
+            const ataIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+                keypair.publicKey, ata, keypair.publicKey, mintKp.publicKey
+            );
             
-            // Buy instruction
             const buyIx = await (program.methods as any)
                 .buy(minTokens, solAmount)
                 .accounts({
@@ -495,6 +570,7 @@ async function buildMultiTransactionBundle(
         
         if (walletSize > 1232) {
             console.log(`    ❌ Wallet TX ${txNumber} too large: ${walletSize} bytes`);
+            console.log(`    💡 Try reducing walletsPerTx from 5 to 4`);
             return [];
         }
 
@@ -502,13 +578,25 @@ async function buildMultiTransactionBundle(
         const signers = [payer, ...chunk.map(w => w.keypair)];
         walletTx.sign(signers);
 
-        // Skip simulation for wallet transactions (they depend on CREATE being successful)
         console.log(`    ✅ Wallet TX ${txNumber} built and signed (${chunk.length} wallets)`);
-
         allTxs.push(walletTx);
     }
 
     console.log(`\n🎉 Bundle complete: ${allTxs.length} transactions ready`);
+    
+    // ✅ Calculate total operations
+    let totalOperations = 1; // CREATE
+    if (devHasBuy) {
+        if (walletStartIndex === 4) {
+            totalOperations += 5; // DEV BUY + 4 wallets
+        } else {
+            totalOperations += 1; // DEV BUY only
+        }
+    }
+    totalOperations += remainingWallets.length; // All remaining wallet buys
+
+    console.log(`📊 Total buying operations: ${totalOperations} (${devHasBuy ? 'including dev buy' : 'wallet buys only'})`);
+    
     return allTxs;
 }
 

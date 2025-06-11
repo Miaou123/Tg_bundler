@@ -1,229 +1,22 @@
-import { connection, wallet, payer } from "../config";
-import { PublicKey, VersionedTransaction, TransactionMessage, SystemProgram, Keypair, LAMPORTS_PER_SOL, ComputeBudgetProgram, TransactionInstruction, ParsedAccountData } from "@solana/web3.js";
+import { connection, wallet, payer, PUMP_PROGRAM, feeRecipient, eventAuthority, global as globalAccount } from "../config";
+import { PublicKey, Transaction, SystemProgram, Keypair, LAMPORTS_PER_SOL, ComputeBudgetProgram, TransactionInstruction, sendAndConfirmTransaction } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
-import { searcherClient } from "./clients/jito";
-import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
 const promptSync = require("prompt-sync");
 import * as spl from "@solana/spl-token";
 import path from "path";
 import bs58 from "bs58";
 import fs from "fs";
-import { getRandomTipAccount } from "./clients/config";
+import BN from "bn.js";
+import * as anchor from "@coral-xyz/anchor";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
-
-function chunkArray<T>(array: T[], size: number): T[][] {
-	return Array.from({ length: Math.ceil(array.length / size) }, (v, i) => array.slice(i * size, i * size + size));
-}
-
-async function sendBundle(bundledTxns: VersionedTransaction[], bundleName: string = "cleanup") {
-	if (bundledTxns.length === 0) {
-		console.log("❌ No transactions to send");
-		return false;
-	}
-
-	console.log(`📤 Sending ${bundleName} bundle with ${bundledTxns.length} transactions to Jito`);
-
-	// ✅ LOG ALL TRANSACTION SIGNATURES
-	console.log(`📋 Transaction signatures for ${bundleName}:`);
-	for (let i = 0; i < bundledTxns.length; i++) {
-		try {
-			const signature = bs58.encode(bundledTxns[i].signatures[0]);
-			console.log(`   TX ${i + 1}: ${signature}`);
-			console.log(`        🔗 https://solscan.io/tx/${signature}`);
-		} catch (error) {
-			console.log(`   TX ${i + 1}: ❌ Could not get signature`);
-		}
-	}
-
-	try {
-		const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
-		console.log(`✅ ${bundleName} bundle sent successfully!`);
-		
-		let bundleIdStr;
-		try {
-			bundleIdStr = bundleId?.toString() || 'unknown';
-		} catch {
-			bundleIdStr = 'unknown';
-		}
-		console.log(`🆔 Bundle ID: ${bundleIdStr}`);
-
-		console.log(`⏳ Waiting for ${bundleName} results...`);
-		await new Promise(resolve => setTimeout(resolve, 15000)); // Wait longer for cleanup
-		
-		console.log(`🔍 Checking ${bundleName} transaction status...`);
-		const success = await verifyBundleSuccess(bundledTxns, bundleName);
-		
-		return success;
-
-	} catch (error) {
-		const err = error as any;
-		console.error(`❌ Jito ${bundleName} bundle error:`, err.message);
-		
-		// ✅ LOG ERROR DETAILS
-		if (err.response) {
-			console.log(`📋 Error response:`, err.response.data || err.response);
-		}
-		if (err.code) {
-			console.log(`📋 Error code:`, err.code);
-		}
-		
-		return false;
-	}
-}
-
-// ✅ NEW: Proper verification that actually checks transaction status
-async function verifyBundleSuccess(bundledTxns: VersionedTransaction[], bundleName: string): Promise<boolean> {
-	console.log(`\n=== VERIFYING ${bundleName.toUpperCase()} SUCCESS ===`);
-
-	try {
-		let successCount = 0;
-		let failedCount = 0;
-		let pendingCount = 0;
-		
-		for (let i = 0; i < bundledTxns.length; i++) {
-			const tx = bundledTxns[i];
-			
-			// Get the transaction signature
-			let signature: string;
-			try {
-				signature = bs58.encode(tx.signatures[0]);
-			} catch (error) {
-				console.log(`⚠️  TX ${i + 1}: Could not get signature`);
-				failedCount++;
-				continue;
-			}
-			
-			try {
-				// ✅ Try multiple ways to check transaction status
-				console.log(`🔍 Checking TX ${i + 1}: ${signature}`);
-				
-				// Method 1: getSignatureStatus
-				const status = await connection.getSignatureStatus(signature, { 
-					searchTransactionHistory: true 
-				});
-				
-				if (status.value?.confirmationStatus) {
-					const isSuccess = !status.value.err;
-					if (isSuccess) {
-						console.log(`✅ TX ${i + 1}: ${status.value.confirmationStatus.toUpperCase()} - SUCCESS`);
-						console.log(`   🔗 https://solscan.io/tx/${signature}`);
-						successCount++;
-					} else {
-						console.log(`❌ TX ${i + 1}: ${status.value.confirmationStatus.toUpperCase()} - FAILED`);
-						console.log(`   🔗 https://solscan.io/tx/${signature}`);
-						console.log(`   📋 Error: ${JSON.stringify(status.value.err)}`);
-						failedCount++;
-					}
-				} else {
-					// Method 2: Try to get transaction details
-					try {
-						const txDetails = await connection.getTransaction(signature, {
-							commitment: 'confirmed',
-							maxSupportedTransactionVersion: 0
-						});
-						
-						if (txDetails) {
-							if (txDetails.meta?.err) {
-								console.log(`❌ TX ${i + 1}: Found but FAILED`);
-								console.log(`   🔗 https://solscan.io/tx/${signature}`);
-								console.log(`   📋 Error: ${JSON.stringify(txDetails.meta.err)}`);
-								failedCount++;
-							} else {
-								console.log(`✅ TX ${i + 1}: Found and SUCCESS`);
-								console.log(`   🔗 https://solscan.io/tx/${signature}`);
-								successCount++;
-							}
-						} else {
-							console.log(`⏳ TX ${i + 1}: Not found on-chain yet`);
-							console.log(`   🔗 https://solscan.io/tx/${signature} (may show later)`);
-							pendingCount++;
-						}
-					} catch (getTransactionError) {
-						console.log(`⏳ TX ${i + 1}: Not found on-chain yet (getTransaction failed)`);
-						console.log(`   🔗 https://solscan.io/tx/${signature} (may show later)`);
-						pendingCount++;
-					}
-				}
-			} catch (error) {
-				console.log(`⚠️  TX ${i + 1}: Status check failed - ${error}`);
-				console.log(`   🔗 https://solscan.io/tx/${signature} (manual check)`);
-				failedCount++;
-			}
-		}
-		
-		console.log(`\n📊 ${bundleName.toUpperCase()} RESULTS:`);
-		console.log(`   ✅ Successful: ${successCount}`);
-		console.log(`   ❌ Failed: ${failedCount}`);
-		console.log(`   ⏳ Pending: ${pendingCount}`);
-		
-		// ✅ More detailed result analysis
-		if (successCount > 0) {
-			console.log(`🎉 ${bundleName.toUpperCase()} PARTIALLY OR FULLY SUCCESSFUL!`);
-			return true;
-		} else if (pendingCount > 0) {
-			console.log(`⏳ ${bundleName.toUpperCase()} still processing - check Solscan links above in a few minutes`);
-			return false;
-		} else {
-			console.log(`❌ ${bundleName.toUpperCase()} completely failed - check Solscan links above for details`);
-			return false;
-		}
-		
-	} catch (error) {
-		console.error(`❌ ${bundleName} verification failed:`, error);
-		return false;
-	}
-}
-
-// ✅ NEW: Split transactions into multiple bundles (max 5 per bundle)
-async function sendMultipleBundles(allTxns: VersionedTransaction[]): Promise<boolean> {
-	if (allTxns.length === 0) {
-		console.log("❌ No transactions to send");
-		return false;
-	}
-
-	console.log(`\n🚀 PREPARING TO SEND ${allTxns.length} TRANSACTIONS`);
-	
-	// Split into bundles of max 5 transactions each
-	const bundleChunks = chunkArray(allTxns, 5);
-	console.log(`📦 Will send ${bundleChunks.length} bundles (max 5 TX each)`);
-	
-	let totalSuccess = 0;
-	let totalFailed = 0;
-
-	for (let i = 0; i < bundleChunks.length; i++) {
-		const chunk = bundleChunks[i];
-		const bundleName = `Bundle ${i + 1}/${bundleChunks.length}`;
-		
-		console.log(`\n${bundleName}: ${chunk.length} transactions`);
-		
-		const success = await sendBundle(chunk, bundleName);
-		
-		if (success) {
-			totalSuccess++;
-		} else {
-			totalFailed++;
-		}
-		
-		// Wait between bundles to avoid rate limiting
-		if (i < bundleChunks.length - 1) {
-			console.log("⏳ Waiting 5 seconds before next bundle...");
-			await new Promise(resolve => setTimeout(resolve, 5000));
-		}
-	}
-
-	console.log(`\n🏁 FINAL CLEANUP RESULTS:`);
-	console.log(`   ✅ Successful bundles: ${totalSuccess}/${bundleChunks.length}`);
-	console.log(`   ❌ Failed bundles: ${totalFailed}/${bundleChunks.length}`);
-	
-	return totalSuccess > 0;
-}
 
 interface TokenAccount {
 	mint: string;
 	balance: number;
 	decimals: number;
+	rawBalance: string;
 }
 
 interface WalletTokens {
@@ -246,13 +39,15 @@ async function getWalletTokenAccounts(walletPubkey: PublicKey): Promise<TokenAcc
 		for (const account of tokenAccounts.value) {
 			const parsedInfo = account.account.data.parsed.info as any;
 			const balance = parsedInfo.tokenAmount.uiAmount;
+			const rawBalance = parsedInfo.tokenAmount.amount;
 			
 			// Only include accounts with actual token balance
 			if (balance && balance > 0) {
 				tokens.push({
 					mint: parsedInfo.mint,
 					balance: balance,
-					decimals: parsedInfo.tokenAmount.decimals
+					decimals: parsedInfo.tokenAmount.decimals,
+					rawBalance: rawBalance
 				});
 			}
 		}
@@ -286,12 +81,14 @@ async function scanAllWallets(): Promise<WalletTokens[]> {
 			});
 		}
 
-		walletsData.push({
-			keypair: wallet,
-			walletName: "DEV WALLET",
-			tokenAccounts: devTokens,
-			solBalance: devSolBalance
-		});
+		if (devTokens.length > 0 || devSolBalance > 0.01 * LAMPORTS_PER_SOL) {
+			walletsData.push({
+				keypair: wallet,
+				walletName: "DEV WALLET",
+				tokenAccounts: devTokens,
+				solBalance: devSolBalance
+			});
+		}
 	} catch (error) {
 		console.log(`⚠️  DEV WALLET: Error checking balance`);
 	}
@@ -305,7 +102,7 @@ async function scanAllWallets(): Promise<WalletTokens[]> {
 			const solBalance = await connection.getBalance(keypair.publicKey);
 			const tokenAccounts = await getWalletTokenAccounts(keypair.publicKey);
 			
-			const hasTokensOrSol = tokenAccounts.length > 0 || solBalance > 0.001 * LAMPORTS_PER_SOL; // More than 0.001 SOL
+			const hasTokensOrSol = tokenAccounts.length > 0 || solBalance > 0.005 * LAMPORTS_PER_SOL; // More than 0.005 SOL
 			
 			if (hasTokensOrSol) {
 				console.log(`✅ Wallet ${i + 1} (${keypair.publicKey.toString().slice(0, 8)}...):`);
@@ -325,7 +122,7 @@ async function scanAllWallets(): Promise<WalletTokens[]> {
 					solBalance: solBalance
 				});
 			} else {
-				console.log(`⚪ Wallet ${i + 1}: Empty`);
+				console.log(`⚪ Wallet ${i + 1}: Empty (${(solBalance / LAMPORTS_PER_SOL).toFixed(6)} SOL)`);
 			}
 		} catch (error) {
 			console.log(`⚠️  Wallet ${i + 1}: Error checking balance`);
@@ -335,37 +132,388 @@ async function scanAllWallets(): Promise<WalletTokens[]> {
 	return walletsData;
 }
 
+// ✅ Check if a token is on Pump.fun (has bonding curve)
+async function isPumpFunToken(mintAddress: PublicKey): Promise<boolean> {
+	try {
+		const [bondingCurve] = PublicKey.findProgramAddressSync(
+			[Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+			PUMP_PROGRAM
+		);
+		
+		const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
+		return bondingCurveInfo !== null;
+	} catch (error) {
+		return false;
+	}
+}
+
+// ✅ Get the actual token creator from bonding curve
+async function getTokenCreator(mintAddress: PublicKey): Promise<PublicKey | null> {
+	try {
+		const [bondingCurve] = PublicKey.findProgramAddressSync(
+			[Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+			PUMP_PROGRAM
+		);
+
+		const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
+		if (!bondingCurveInfo) {
+			return null;
+		}
+
+		// ✅ FIX: Parse bonding curve data correctly
+		// Bonding curve layout: discriminator(8) + virtual_token_reserves(8) + virtual_sol_reserves(8) + 
+		// real_token_reserves(8) + real_sol_reserves(8) + token_total_supply(8) + complete(1) + creator(32)
+		const creatorOffset = 8 + 8 + 8 + 8 + 8 + 8 + 1; // = 49 bytes
+		const creatorBytes = bondingCurveInfo.data.slice(creatorOffset, creatorOffset + 32);
+		const creator = new PublicKey(creatorBytes);
+		
+		console.log(`    🔍 Token creator found: ${creator.toString()}`);
+		return creator;
+	} catch (error) {
+		console.log(`    ⚠️  Could not get token creator: ${error}`);
+		return null;
+	}
+}
+
+// ✅ Create Pump.fun sell instruction
+async function createPumpFunSellInstruction(
+	wallet: Keypair,
+	mintAddress: PublicKey,
+	tokenAmount: string
+): Promise<TransactionInstruction | null> {
+	try {
+		// Setup Anchor
+		const provider = new anchor.AnchorProvider(
+			connection,
+			new anchor.Wallet(wallet),
+			{ commitment: "confirmed" }
+		);
+
+		const IDL_PumpFun = JSON.parse(fs.readFileSync("./pumpfun-IDL.json", "utf-8"));
+		const program = new anchor.Program(IDL_PumpFun, provider);
+
+		// ✅ FIX: Get the actual token creator from bonding curve
+		const tokenCreator = await getTokenCreator(mintAddress);
+		if (!tokenCreator) {
+			console.log(`    ❌ Could not determine token creator`);
+			return null;
+		}
+
+		// Calculate PDAs
+		const [bondingCurve] = PublicKey.findProgramAddressSync(
+			[Buffer.from("bonding-curve"), mintAddress.toBytes()], 
+			PUMP_PROGRAM
+		);
+		const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+			[bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintAddress.toBytes()],
+			spl.ASSOCIATED_TOKEN_PROGRAM_ID
+		);
+		// ✅ FIX: Use actual token creator, not the selling wallet
+		const [creatorVault] = PublicKey.findProgramAddressSync(
+			[Buffer.from("creator-vault"), tokenCreator.toBytes()], 
+			PUMP_PROGRAM
+		);
+
+		const walletTokenATA = spl.getAssociatedTokenAddressSync(mintAddress, wallet.publicKey);
+
+		// Create sell instruction
+		const sellAmount = new BN(tokenAmount);
+		const minSolOut = new BN(0); // Accept any amount of SOL (no slippage protection)
+
+		const sellIx = await (program.methods as any)
+			.sell(sellAmount, minSolOut)
+			.accounts({
+				global: globalAccount,
+				feeRecipient: feeRecipient,
+				mint: mintAddress,
+				bondingCurve: bondingCurve,
+				associatedBondingCurve: associatedBondingCurve,
+				associatedUser: walletTokenATA,
+				user: wallet.publicKey,
+				systemProgram: SystemProgram.programId,
+				creatorVault: creatorVault,
+				tokenProgram: spl.TOKEN_PROGRAM_ID,
+				eventAuthority: eventAuthority,
+				program: PUMP_PROGRAM,
+			})
+			.instruction();
+
+		return sellIx;
+	} catch (error) {
+		console.error(`Failed to create sell instruction for ${mintAddress.toString()}:`, error);
+		return null;
+	}
+}
+
+// ✅ Process a single wallet - sell all tokens and transfer SOL (except dev wallet)
+async function processWallet(walletData: WalletTokens): Promise<boolean> {
+	console.log(`\n🔄 Processing ${walletData.walletName}...`);
+	
+	let success = true;
+	const isDevWallet = walletData.walletName === "DEV WALLET";
+
+	// ✅ Check if token amount is worth selling (considering gas costs)
+	const estimatedGasCost = 0.0015 * LAMPORTS_PER_SOL; // ~0.0015 SOL per transaction
+	const minTokenValue = 0.002 * LAMPORTS_PER_SOL; // Only sell if likely to get >0.002 SOL
+
+	// Step 1: Sell all tokens (but skip tiny amounts)
+	for (const tokenAccount of walletData.tokenAccounts) {
+		try {
+			// ✅ Handle tokens with very small amounts (burn them first, then close ATA)
+			if (tokenAccount.balance <= 0.001) {
+				console.log(`  🔥 Burning ${tokenAccount.balance.toFixed(6)} tokens of ${tokenAccount.mint.slice(0, 8)}... (too small to sell)`);
+				
+				try {
+					const mintAddress = new PublicKey(tokenAccount.mint);
+					const tokenAccountAddress = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
+					
+					// Get actual balance from chain
+					const tokenAccountInfo = await connection.getTokenAccountBalance(tokenAccountAddress);
+					const actualBalance = BigInt(tokenAccountInfo.value.amount);
+					
+					if (actualBalance > BigInt(0)) {
+						console.log(`    🔥 Burning ${tokenAccountInfo.value.uiAmountString} tokens...`);
+						
+						// Create burn transaction
+						const burnTransaction = new Transaction();
+						burnTransaction.add(
+							ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 }),
+							ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+						);
+
+						// Burn all tokens (transfer to burn address)
+						const burnAddress = new PublicKey("11111111111111111111111111111111"); // System program = burn address
+						
+						// Actually, let's use the proper burn instruction instead of transfer to burn address
+						const burnIx = spl.createBurnInstruction(
+							tokenAccountAddress, // account to burn from
+							mintAddress, // mint
+							walletData.keypair.publicKey, // owner
+							actualBalance // amount to burn
+						);
+
+						burnTransaction.add(burnIx);
+						
+						const burnSignature = await sendAndConfirmTransaction(
+							connection,
+							burnTransaction,
+							[walletData.keypair],
+							{ commitment: "confirmed", maxRetries: 3 }
+						);
+						
+						console.log(`    ✅ Burned tokens successfully`);
+						console.log(`    🔗 https://solscan.io/tx/${burnSignature}`);
+						
+						// Wait for burn to settle
+						await new Promise(resolve => setTimeout(resolve, 2000));
+					}
+
+					// Now close the account (should have zero balance after burn)
+					const closeTransaction = new Transaction();
+					closeTransaction.add(
+						ComputeBudgetProgram.setComputeUnitLimit({ units: 100000 }),
+						ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+					);
+
+					const closeAccountIx = spl.createCloseAccountInstruction(
+						tokenAccountAddress,
+						walletData.keypair.publicKey, // Rent goes back to wallet
+						walletData.keypair.publicKey
+					);
+					
+					closeTransaction.add(closeAccountIx);
+					
+					const closeSignature = await sendAndConfirmTransaction(
+						connection,
+						closeTransaction,
+						[walletData.keypair],
+						{ commitment: "confirmed", maxRetries: 3 }
+					);
+					
+					console.log(`    ✅ Closed token account (reclaimed ~0.002 SOL rent)`);
+					console.log(`    🔗 https://solscan.io/tx/${closeSignature}`);
+					
+				} catch (error) {
+					console.log(`    ⚠️  Failed to burn/close token account: ${error}`);
+				}
+				
+				continue; // Skip to next token
+			}
+
+			console.log(`  🔄 Selling ${tokenAccount.balance.toFixed(2)} tokens of ${tokenAccount.mint.slice(0, 8)}...`);
+			
+			const mintAddress = new PublicKey(tokenAccount.mint);
+			
+			// Check if it's a Pump.fun token
+			const isPumpToken = await isPumpFunToken(mintAddress);
+			
+			if (isPumpToken) {
+				console.log(`    💊 Pump.fun token detected, using Pump.fun sell`);
+				
+				// Create sell transaction
+				const transaction = new Transaction();
+				
+				// ✅ UPDATED: More reasonable gas fees for cleanup (not high priority)
+				transaction.add(
+					ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
+					ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 }) // Lower priority for cleanup
+				);
+
+				// Add sell instruction
+				const sellIx = await createPumpFunSellInstruction(
+					walletData.keypair,
+					mintAddress,
+					tokenAccount.rawBalance
+				);
+
+				if (sellIx) {
+					transaction.add(sellIx);
+
+					// Send transaction
+					try {
+						const signature = await sendAndConfirmTransaction(
+							connection,
+							transaction,
+							[walletData.keypair],
+							{
+								commitment: "confirmed",
+								maxRetries: 3
+							}
+						);
+
+						console.log(`    ✅ Sold tokens successfully!`);
+						console.log(`    🔗 https://solscan.io/tx/${signature}`);
+					} catch (error) {
+						console.log(`    ❌ Failed to sell tokens: ${error}`);
+						success = false;
+					}
+				} else {
+					console.log(`    ❌ Failed to create sell instruction`);
+					success = false;
+				}
+			} else {
+				console.log(`    ⚠️  Not a Pump.fun token, skipping (could be Raydium or other DEX)`);
+				// For non-Pump.fun tokens, we could add Jupiter swap integration here
+				// For now, we just close the token account to reclaim rent
+				try {
+					const transaction = new Transaction();
+					transaction.add(
+						ComputeBudgetProgram.setComputeUnitLimit({ units: 100000 }),
+						ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50000 })
+					);
+
+					const tokenAccountAddress = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
+					const closeAccountIx = spl.createCloseAccountInstruction(
+						tokenAccountAddress,
+						walletData.keypair.publicKey, // Rent goes back to wallet
+						walletData.keypair.publicKey
+					);
+					
+					transaction.add(closeAccountIx);
+					
+					const signature = await sendAndConfirmTransaction(
+						connection,
+						transaction,
+						[walletData.keypair],
+						{ commitment: "confirmed", maxRetries: 3 }
+					);
+					
+					console.log(`    ✅ Closed token account (reclaimed rent)`);
+					console.log(`    🔗 https://solscan.io/tx/${signature}`);
+				} catch (error) {
+					console.log(`    ⚠️  Failed to close token account: ${error}`);
+				}
+			}
+
+			// Wait between token sales to avoid rate limiting
+			await new Promise(resolve => setTimeout(resolve, 1000));
+
+		} catch (error) {
+			console.log(`    ❌ Error processing token ${tokenAccount.mint.slice(0, 8)}: ${error}`);
+			success = false;
+		}
+	}
+
+	// Step 2: Transfer SOL to payer (SKIP for dev wallet)
+	if (isDevWallet) {
+		console.log(`  👤 DEV WALLET: Keeping SOL in dev wallet (no transfer)`);
+		
+		// Still show the balance for reference
+		try {
+			const currentBalance = await connection.getBalance(walletData.keypair.publicKey);
+			console.log(`  💰 Dev wallet SOL balance: ${(currentBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL (kept in dev wallet)`);
+		} catch (error) {
+			console.log(`  ⚠️  Could not check dev wallet balance`);
+		}
+	} else {
+		// Transfer SOL for non-dev wallets
+		try {
+			console.log(`  💰 Transferring remaining SOL to payer...`);
+			
+			// Get current balance (may have changed after token sales)
+			const currentBalance = await connection.getBalance(walletData.keypair.publicKey);
+			const fee = 0.001 * LAMPORTS_PER_SOL; // Reserve for transaction fee
+			const transferAmount = currentBalance - fee;
+
+				// ✅ UPDATED: More reasonable gas fees for SOL transfer
+			if (transferAmount > 0) {
+				const transaction = new Transaction();
+				transaction.add(
+					ComputeBudgetProgram.setComputeUnitLimit({ units: 50000 }),
+					ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 25000 }) // Low priority for cleanup
+				);
+
+				transaction.add(
+					SystemProgram.transfer({
+						fromPubkey: walletData.keypair.publicKey,
+						toPubkey: payer.publicKey,
+						lamports: Math.floor(transferAmount),
+					})
+				);
+
+				const signature = await sendAndConfirmTransaction(
+					connection,
+					transaction,
+					[walletData.keypair],
+					{
+						commitment: "confirmed",
+						maxRetries: 3
+					}
+				);
+
+				console.log(`  ✅ Transferred ${(transferAmount / LAMPORTS_PER_SOL).toFixed(4)} SOL to payer`);
+				console.log(`  🔗 https://solscan.io/tx/${signature}`);
+			} else {
+				console.log(`  ℹ️  No SOL to transfer (balance too low after fees)`);
+			}
+
+		} catch (error) {
+			console.log(`  ❌ Failed to transfer SOL: ${error}`);
+			success = false;
+		}
+	}
+
+	return success;
+}
+
 // ✅ MAIN CLEANUP FUNCTION
 export async function sellAllTokensAndCleanup() {
-	console.log("🧹 COMPLETE WALLET CLEANUP");
-	console.log("==========================");
+	console.log("🧹 SIMPLIFIED WALLET CLEANUP");
+	console.log("=============================");
 	console.log("This will:");
-	console.log("• Close ALL token accounts in ALL wallets");
-	console.log("• Send ALL remaining SOL back to payer wallet");
-	console.log("• Clean up everything from previous launches");
+	console.log("• Sell ALL Pump.fun tokens to SOL");
+	console.log("• Close non-Pump.fun token accounts");
+	console.log("• Transfer SOL from generated wallets to payer");
+	console.log("• Keep SOL in dev wallet (no transfer)");
+	console.log("• Process each wallet individually (no Jito bundles)");
 
-	const proceed = prompt("\n⚠️  PROCEED WITH COMPLETE CLEANUP? (y/yes): ").toLowerCase();
+	const proceed = prompt("\n⚠️  PROCEED WITH SIMPLIFIED CLEANUP? (y/yes): ").toLowerCase();
 	if (proceed !== 'yes' && proceed !== 'y') {
 		console.log("Cleanup cancelled.");
 		return;
 	}
 
 	try {
-		// Load LUT for transaction optimization
-		let poolInfo: { [key: string]: any } = {};
-		if (fs.existsSync(keyInfoPath)) {
-			const data = fs.readFileSync(keyInfoPath, "utf-8");
-			poolInfo = JSON.parse(data);
-		}
-
-		let lookupTableAccount = null;
-		if (poolInfo.addressLUT) {
-			const lut = new PublicKey(poolInfo.addressLUT.toString());
-			lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
-		}
-
-		const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
-
 		// ✅ Scan all wallets
 		const walletsData = await scanAllWallets();
 		
@@ -377,311 +525,69 @@ export async function sellAllTokensAndCleanup() {
 		console.log(`\n📊 CLEANUP SUMMARY:`);
 		console.log(`   Wallets to clean: ${walletsData.length}`);
 		console.log(`   Total token types found: ${walletsData.reduce((sum, w) => sum + w.tokenAccounts.length, 0)}`);
-		console.log(`   Total SOL to recover: ${(walletsData.reduce((sum, w) => sum + w.solBalance, 0) / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
-
-		// ✅ Build cleanup transactions with smarter chunking
-		console.log("\n=== BUILDING CLEANUP TRANSACTIONS ===");
-		const bundledTxns: VersionedTransaction[] = [];
-		const { blockhash } = await connection.getLatestBlockhash();
-
-		// Handle wallets with many tokens separately (one wallet per transaction)
-		const largeWallets = walletsData.filter(w => w.tokenAccounts.length > 5);
-		const smallWallets = walletsData.filter(w => w.tokenAccounts.length <= 5);
-
-		console.log(`📊 Processing strategy:`);
-		console.log(`   Large wallets (>5 tokens): ${largeWallets.length} - one per transaction`);
-		console.log(`   Small wallets (≤5 tokens): ${smallWallets.length} - chunked together`);
-
-		// ✅ Handle large wallets (one wallet per transaction)
-		for (let i = 0; i < largeWallets.length; i++) {
-			const walletData = largeWallets[i];
-			
-			console.log(`🔨 Building large wallet TX ${i + 1}: ${walletData.walletName} (${walletData.tokenAccounts.length} tokens)`);
-
-			const cleanupInstructions: TransactionInstruction[] = [];
-
-			// Compute budget for large wallet
-			cleanupInstructions.push(
-				ComputeBudgetProgram.setComputeUnitLimit({ units: 600000 + (walletData.tokenAccounts.length * 30000) }),
-				ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200000 })
-			);
-
-			// Close all token accounts for this large wallet
-			for (const tokenAccount of walletData.tokenAccounts) {
-				try {
-					const tokenAccountAddress = spl.getAssociatedTokenAddressSync(
-						new PublicKey(tokenAccount.mint), 
-						walletData.keypair.publicKey
-					);
-
-					const closeAccountIx = spl.createCloseAccountInstruction(
-						tokenAccountAddress,
-						payer.publicKey,
-						walletData.keypair.publicKey
-					);
-
-					cleanupInstructions.push(closeAccountIx);
-					console.log(`  🗑️  ${walletData.walletName}: Closing ${tokenAccount.mint.slice(0, 8)}...`);
-				} catch (error) {
-					console.log(`  ⚠️  ${walletData.walletName}: Error closing ${tokenAccount.mint.slice(0, 8)}...`);
-				}
-			}
-
-			// Send remaining SOL to payer
-			const solToSend = walletData.solBalance - 0.002 * LAMPORTS_PER_SOL; // Leave more SOL for fees
-			if (solToSend > 0) {
-				const solTransferIx = SystemProgram.transfer({
-					fromPubkey: walletData.keypair.publicKey,
-					toPubkey: payer.publicKey,
-					lamports: Math.floor(solToSend),
-				});
-
-				cleanupInstructions.push(solTransferIx);
-				console.log(`  💰 ${walletData.walletName}: Sending ${(solToSend / LAMPORTS_PER_SOL).toFixed(4)} SOL to payer`);
-			}
-
-			// Build and add transaction
-			if (cleanupInstructions.length > 2) {
-				const message = new TransactionMessage({
-					payerKey: payer.publicKey,
-					recentBlockhash: blockhash,
-					instructions: cleanupInstructions,
-				}).compileToV0Message(lookupTableAccount ? [lookupTableAccount] : []);
-
-				const versionedTx = new VersionedTransaction(message);
-
-				// Size check
-				const txSize = versionedTx.serialize().length;
-				console.log(`  📏 Large wallet TX size: ${txSize}/1232 bytes`);
-				
-				if (txSize > 1232) {
-					console.log(`  ⚠️  Large wallet TX too big, splitting into smaller chunks needed`);
-					
-					// Split this large wallet into multiple transactions
-					const tokenChunks = chunkArray(walletData.tokenAccounts, 8); // 8 tokens per TX
-					
-					for (let chunkIdx = 0; chunkIdx < tokenChunks.length; chunkIdx++) {
-						const tokenChunk = tokenChunks[chunkIdx];
-						const isLastTokenChunk = chunkIdx === tokenChunks.length - 1;
-						
-						const chunkInstructions: TransactionInstruction[] = [];
-						
-						// Compute budget
-						chunkInstructions.push(
-							ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 }),
-							ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
-						);
-
-						// Close tokens in this chunk
-						for (const tokenAccount of tokenChunk) {
-							try {
-								const tokenAccountAddress = spl.getAssociatedTokenAddressSync(
-									new PublicKey(tokenAccount.mint), 
-									walletData.keypair.publicKey
-								);
-
-								const closeAccountIx = spl.createCloseAccountInstruction(
-									tokenAccountAddress,
-									payer.publicKey,
-									walletData.keypair.publicKey
-								);
-
-								chunkInstructions.push(closeAccountIx);
-							} catch (error) {
-								console.log(`    ⚠️  Error closing token ${tokenAccount.mint.slice(0, 8)}...`);
-							}
-						}
-
-						// Send SOL only in the last chunk
-						if (isLastTokenChunk && solToSend > 0) {
-							const solTransferIx = SystemProgram.transfer({
-								fromPubkey: walletData.keypair.publicKey,
-								toPubkey: payer.publicKey,
-								lamports: Math.floor(solToSend),
-							});
-							chunkInstructions.push(solTransferIx);
-						}
-
-						// Build chunk transaction
-						const chunkMessage = new TransactionMessage({
-							payerKey: payer.publicKey,
-							recentBlockhash: blockhash,
-							instructions: chunkInstructions,
-						}).compileToV0Message(lookupTableAccount ? [lookupTableAccount] : []);
-
-						const chunkTx = new VersionedTransaction(chunkMessage);
-						const chunkSize = chunkTx.serialize().length;
-						console.log(`    📏 Chunk ${chunkIdx + 1} size: ${chunkSize}/1232 bytes`);
-
-						chunkTx.sign([payer, walletData.keypair]);
-						bundledTxns.push(chunkTx);
-						console.log(`    ✅ ${walletData.walletName} chunk ${chunkIdx + 1}/${tokenChunks.length} built`);
-					}
-				} else {
-					// Single transaction fits
-					versionedTx.sign([payer, walletData.keypair]);
-					bundledTxns.push(versionedTx);
-					console.log(`  ✅ ${walletData.walletName} TX built`);
-				}
-			}
-		}
-
-		// ✅ Handle small wallets (chunk together)
-		if (smallWallets.length > 0) {
-			const smallWalletChunks = chunkArray(smallWallets, 2); // Only 2 small wallets per transaction
-
-			for (let chunkIndex = 0; chunkIndex < smallWalletChunks.length; chunkIndex++) {
-				const chunk = smallWalletChunks[chunkIndex];
-				const isLastChunk = chunkIndex === smallWalletChunks.length - 1 && largeWallets.length === 0;
-				
-				console.log(`🔨 Building small wallets TX ${chunkIndex + 1}: ${chunk.length} wallets`);
-
-				const cleanupInstructions: TransactionInstruction[] = [];
-				const chunkSigners: Keypair[] = [payer];
-
-				// Compute budget
-				const totalTokens = chunk.reduce((sum, w) => sum + w.tokenAccounts.length, 0);
-				cleanupInstructions.push(
-					ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 + (totalTokens * 25000) }),
-					ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
-				);
-
-				for (const walletData of chunk) {
-					// Close token accounts
-					for (const tokenAccount of walletData.tokenAccounts) {
-						try {
-							const tokenAccountAddress = spl.getAssociatedTokenAddressSync(
-								new PublicKey(tokenAccount.mint), 
-								walletData.keypair.publicKey
-							);
-
-							const closeAccountIx = spl.createCloseAccountInstruction(
-								tokenAccountAddress,
-								payer.publicKey,
-								walletData.keypair.publicKey
-							);
-
-							cleanupInstructions.push(closeAccountIx);
-							console.log(`  🗑️  ${walletData.walletName}: Closing ${tokenAccount.mint.slice(0, 8)}...`);
-						} catch (error) {
-							console.log(`  ⚠️  ${walletData.walletName}: Error closing token account`);
-						}
-					}
-
-					// Send SOL
-					const solToSend = walletData.solBalance - 0.001 * LAMPORTS_PER_SOL;
-					if (solToSend > 0) {
-						const solTransferIx = SystemProgram.transfer({
-							fromPubkey: walletData.keypair.publicKey,
-							toPubkey: payer.publicKey,
-							lamports: Math.floor(solToSend),
-						});
-
-						cleanupInstructions.push(solTransferIx);
-						console.log(`  💰 ${walletData.walletName}: Sending ${(solToSend / LAMPORTS_PER_SOL).toFixed(4)} SOL to payer`);
-					}
-
-					chunkSigners.push(walletData.keypair);
-				}
-
-				// Add Jito tip to last transaction
-				if (isLastChunk) {
-					console.log(`  💰 Adding Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
-					cleanupInstructions.push(
-						SystemProgram.transfer({
-							fromPubkey: payer.publicKey,
-							toPubkey: getRandomTipAccount(),
-							lamports: BigInt(jitoTipAmt),
-						})
-					);
-				}
-
-				if (cleanupInstructions.length > 2) {
-					const message = new TransactionMessage({
-						payerKey: payer.publicKey,
-						recentBlockhash: blockhash,
-						instructions: cleanupInstructions,
-					}).compileToV0Message(lookupTableAccount ? [lookupTableAccount] : []);
-
-					const versionedTx = new VersionedTransaction(message);
-
-					const txSize = versionedTx.serialize().length;
-					console.log(`  📏 Small wallets TX size: ${txSize}/1232 bytes`);
-					
-					if (txSize <= 1232) {
-						versionedTx.sign(chunkSigners);
-						bundledTxns.push(versionedTx);
-						console.log(`  ✅ Small wallets TX ${chunkIndex + 1} built with ${chunkSigners.length} signers`);
-					} else {
-						console.log(`  ⚠️  Small wallets TX too large, skipping`);
-					}
-				}
-			}
-		}
-
-		// Add Jito tip as separate transaction if needed
-		if (largeWallets.length > 0) {
-			console.log(`💰 Adding separate Jito tip transaction`);
-			const tipInstructions = [
-				ComputeBudgetProgram.setComputeUnitLimit({ units: 50000 }),
-				SystemProgram.transfer({
-					fromPubkey: payer.publicKey,
-					toPubkey: getRandomTipAccount(),
-					lamports: BigInt(jitoTipAmt),
-				})
-			];
-
-			const tipMessage = new TransactionMessage({
-				payerKey: payer.publicKey,
-				recentBlockhash: blockhash,
-				instructions: tipInstructions,
-			}).compileToV0Message([]);
-
-			const tipTx = new VersionedTransaction(tipMessage);
-			tipTx.sign([payer]);
-			bundledTxns.push(tipTx);
-		}
-
-		if (bundledTxns.length === 0) {
-			console.log("❌ No cleanup transactions were built!");
-			return;
-		}
-
-		// ✅ Final confirmation and send
-		console.log(`\n=== FINAL CLEANUP CONFIRMATION ===`);
-		console.log(`📦 Transactions: ${bundledTxns.length}`);
-		console.log(`🗑️  Will close ALL token accounts`);
-		console.log(`💰 Will send ALL SOL to payer: ${payer.publicKey.toString()}`);
-		console.log(`💸 Jito tip: ${jitoTipAmt / LAMPORTS_PER_SOL} SOL`);
 		
-		const finalConfirm = prompt("\n🧹 EXECUTE COMPLETE CLEANUP? (yes to confirm): ").toLowerCase();
+		// ✅ FIX: Exclude dev wallet SOL from recovery calculation
+		const solToRecover = walletsData
+			.filter(w => w.walletName !== "DEV WALLET")
+			.reduce((sum, w) => sum + w.solBalance, 0);
+		console.log(`   Total SOL to recover: ${(solToRecover / LAMPORTS_PER_SOL).toFixed(4)} SOL (excluding dev wallet)`);
+
+		const finalConfirm = prompt("\n🧹 EXECUTE SIMPLIFIED CLEANUP? (yes to confirm): ").toLowerCase();
 		if (finalConfirm !== 'yes') {
 			console.log("Cleanup cancelled.");
 			return;
 		}
 
-		// Send bundles with proper verification
-		console.log("\n🚀 Executing cleanup...");
-		const success = await sendMultipleBundles(bundledTxns);
+		// ✅ Process each wallet individually
+		console.log("\n🚀 Starting cleanup process...");
+		let successCount = 0;
+		let failedCount = 0;
 
-		if (success) {
-			console.log("\n🎉 CLEANUP COMPLETED!");
-			console.log("✅ At least some transactions succeeded");
-			console.log("💡 Check individual transaction results above");
-			console.log("✅ Wallets should now be cleaner");
+		for (let i = 0; i < walletsData.length; i++) {
+			const walletData = walletsData[i];
 			
-			// Show payer balance after cleanup
-			setTimeout(async () => {
-				try {
-					const payerBalance = await connection.getBalance(payer.publicKey);
-					console.log(`💰 Payer balance after cleanup: ${(payerBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
-				} catch (error) {
-					console.log("Could not check final payer balance");
-				}
-			}, 5000);
-		} else {
-			console.log("\n❌ CLEANUP FAILED");
-			console.log("💡 All bundles failed - check network conditions and try again");
+			console.log(`\n📍 Progress: ${i + 1}/${walletsData.length}`);
+			const walletSuccess = await processWallet(walletData);
+			
+			if (walletSuccess) {
+				console.log(`✅ ${walletData.walletName} completed successfully`);
+				successCount++;
+			} else {
+				console.log(`❌ ${walletData.walletName} had some failures`);
+				failedCount++;
+			}
+
+			// Wait between wallets to be nice to the RPC
+			if (i < walletsData.length - 1) {
+				console.log("⏳ Waiting 2 seconds before next wallet...");
+				await new Promise(resolve => setTimeout(resolve, 2000));
+			}
+		}
+
+		// ✅ Final results
+		console.log("\n🎉 CLEANUP COMPLETED!");
+		console.log(`📊 Results:`);
+		console.log(`   ✅ Successful wallets: ${successCount}`);
+		console.log(`   ❌ Failed wallets: ${failedCount}`);
+		console.log(`   📍 Total processed: ${walletsData.length}`);
+
+		// Show payer balance after cleanup
+		setTimeout(async () => {
+			try {
+				const payerBalance = await connection.getBalance(payer.publicKey);
+				console.log(`\n💰 Final payer balance: ${(payerBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+			} catch (error) {
+				console.log("Could not check final payer balance");
+			}
+		}, 3000);
+
+		if (successCount > 0) {
+			console.log("\n✅ At least some wallets were cleaned successfully!");
+			console.log("💡 Check individual transaction results above");
+		}
+
+		if (failedCount > 0) {
+			console.log("\n⚠️  Some wallets had failures - you may need to manually check them");
 		}
 
 	} catch (error) {
