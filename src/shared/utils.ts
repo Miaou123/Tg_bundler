@@ -1,153 +1,160 @@
-import fs from 'fs';
-import path from 'path';
-import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
-import bs58 from 'bs58';
-import { KEY_INFO_PATH, connection } from './config';
-import { PoolInfo } from './types';
+import * as fs from 'fs';
+import { getUserKeyInfoPath } from './config';
 
 /**
- * Escapes special characters for Markdown V2 format
- * @param text Text to escape
- * @returns Escaped text
+ * Load user-specific pool info
+ * @param userId Telegram user ID
+ * @returns Pool info object
  */
-export function escapeMarkdown(text: string): string {
-  return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
-}
-
-/**
- * Splits a message into chunks respecting the Telegram message size limit
- * @param text Text to split
- * @param maxLength Maximum length per chunk
- * @returns Array of message chunks
- */
-export function splitMessage(text: string, maxLength: number = 4000): string[] {
-  if (text.length <= maxLength) return [text];
+export function loadUserPoolInfo(userId: number): any {
+  const keyInfoPath = getUserKeyInfoPath(userId);
   
-  const chunks: string[] = [];
-  let currentChunk = '';
-  
-  const lines = text.split('\n');
-  
-  for (const line of lines) {
-    if (currentChunk.length + line.length + 1 <= maxLength) {
-      currentChunk += (currentChunk ? '\n' : '') + line;
-    } else {
-      if (currentChunk) chunks.push(currentChunk);
-      currentChunk = line;
-    }
-  }
-  
-  if (currentChunk) chunks.push(currentChunk);
-  
-  return chunks;
-}
-
-/**
- * Loads the pool information from keyInfo.json
- * @returns Pool information
- */
-export function loadPoolInfo(): PoolInfo {
-  if (!fs.existsSync(KEY_INFO_PATH)) {
+  if (!fs.existsSync(keyInfoPath)) {
     return {};
   }
 
-  const data = fs.readFileSync(KEY_INFO_PATH, 'utf-8');
-  return JSON.parse(data);
-}
-
-/**
- * Saves pool information to keyInfo.json
- * @param poolInfo Pool information
- */
-export function savePoolInfo(poolInfo: PoolInfo): void {
-  fs.writeFileSync(KEY_INFO_PATH, JSON.stringify(poolInfo, null, 2));
-}
-
-/**
- * Formats a SOL amount with proper decimals
- * @param lamports Amount in lamports
- * @returns Formatted SOL amount
- */
-export function formatSol(lamports: number): string {
-  return (lamports / LAMPORTS_PER_SOL).toFixed(4);
-}
-
-/**
- * Formats a token amount with proper decimals (assuming 6 decimals)
- * @param amount Raw token amount
- * @returns Formatted token amount
- */
-export function formatTokenAmount(amount: number): string {
-  return (amount / 1e6).toFixed(2);
-}
-
-/**
- * Formats a timestamp to a readable date string
- * @param timestamp UNIX timestamp
- * @returns Formatted date string
- */
-export function formatDate(timestamp: number): string {
-  return new Date(timestamp).toLocaleString();
-}
-
-/**
- * Validates that a string is a valid base58 encoded private key
- * @param privateKeyString Base58 private key string
- * @returns Whether the string is a valid private key
- */
-export function isValidPrivateKey(privateKeyString: string): boolean {
   try {
-    const decoded = bs58.decode(privateKeyString);
-    return decoded.length === 64; // Solana private keys are 64 bytes
+    const data = fs.readFileSync(keyInfoPath, 'utf8');
+    return JSON.parse(data);
   } catch (error) {
-    return false;
+    console.error(`Error loading pool info for user ${userId}:`, error);
+    return {};
   }
 }
 
 /**
- * Validates that a string is a valid Solana address
- * @param addressString Solana address string
- * @returns Whether the string is a valid address
+ * Save user-specific pool info
+ * @param userId Telegram user ID
+ * @param poolInfo Pool info object to save
  */
-export function isValidSolanaAddress(addressString: string): boolean {
+export function saveUserPoolInfo(userId: number, poolInfo: any): void {
+  const keyInfoPath = getUserKeyInfoPath(userId);
+  
   try {
-    new PublicKey(addressString);
-    return true;
+    // Ensure userId is always included
+    poolInfo.userId = userId;
+    poolInfo.updatedAt = new Date().toISOString();
+    
+    fs.writeFileSync(keyInfoPath, JSON.stringify(poolInfo, null, 2));
   } catch (error) {
-    return false;
+    console.error(`Error saving pool info for user ${userId}:`, error);
+    throw error;
   }
 }
 
 /**
- * Validates that an amount is a valid SOL amount
- * @param amountString SOL amount string
- * @returns Whether the amount is valid
+ * Legacy functions for backward compatibility - now require userId
  */
-export function isValidSolAmount(amountString: string): boolean {
-  const amount = parseFloat(amountString);
-  return !isNaN(amount) && amount > 0 && amount <= 100000; // Reasonable range check
+export function loadPoolInfo(userId?: number): any {
+  if (!userId) {
+    throw new Error('loadPoolInfo now requires userId parameter. Use loadUserPoolInfo(userId) instead.');
+  }
+  return loadUserPoolInfo(userId);
+}
+
+export function savePoolInfo(poolInfo: any, userId?: number): void {
+  if (!userId) {
+    throw new Error('savePoolInfo now requires userId parameter. Use saveUserPoolInfo(userId, poolInfo) instead.');
+  }
+  return saveUserPoolInfo(userId, poolInfo);
 }
 
 /**
- * Waits for a specified amount of time
- * @param ms Time to wait in milliseconds
- * @returns Promise that resolves after the timeout
+ * Check if user has valid pool info
+ * @param userId Telegram user ID
+ * @returns Whether user has pool info
+ */
+export function userHasPoolInfo(userId: number): boolean {
+  const keyInfoPath = getUserKeyInfoPath(userId);
+  return fs.existsSync(keyInfoPath);
+}
+
+/**
+ * Get user's wallet count from pool info
+ * @param userId Telegram user ID
+ * @returns Number of wallets or 0 if none
+ */
+export function getUserWalletCount(userId: number): number {
+  const poolInfo = loadUserPoolInfo(userId);
+  return poolInfo.numOfWallets || 0;
+}
+
+/**
+ * Escape MarkdownV2 special characters
+ * @param text Text to escape
+ * @returns Escaped text safe for MarkdownV2
+ */
+export function escapeMarkdown(text: string): string {
+  // MarkdownV2 special characters that need escaping
+  return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+}
+/**
+ * Format currency amount
+ * @param amount Amount to format
+ * @param currency Currency symbol (default: SOL)
+ * @returns Formatted currency string
+ */
+export function formatCurrency(amount: number, currency: string = 'SOL'): string {
+  return `${amount.toFixed(4)} ${currency}`;
+}
+
+/**
+ * Format percentage
+ * @param value Percentage value
+ * @returns Formatted percentage string
+ */
+export function formatPercentage(value: number): string {
+  return `${value.toFixed(2)}%`;
+}
+
+/**
+ * Sleep utility function
+ * @param ms Milliseconds to sleep
+ * @returns Promise that resolves after delay
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
- * Gets the SOL balance for a given public key
- * @param publicKey Public key to check
- * @returns SOL balance
+ * Validate Solana address format
+ * @param address Address string to validate
+ * @returns Whether address is valid format
  */
-export async function getSolBalance(publicKey: PublicKey): Promise<number> {
+export function isValidSolanaAddress(address: string): boolean {
   try {
-    const balance = await connection.getBalance(publicKey);
-    return balance / LAMPORTS_PER_SOL;
-  } catch (error) {
-    console.error("Error getting SOL balance:", error);
-    return 0;
+    // Basic validation - should be base58 and correct length
+    return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address);
+  } catch {
+    return false;
   }
 }
+
+/**
+ * Truncate address for display
+ * @param address Full address string
+ * @param startLength Characters to show at start (default: 4)
+ * @param endLength Characters to show at end (default: 4)
+ * @returns Truncated address with ellipsis
+ */
+export function truncateAddress(address: string, startLength: number = 4, endLength: number = 4): string {
+  if (address.length <= startLength + endLength) {
+    return address;
+  }
+  return `${address.slice(0, startLength)}...${address.slice(-endLength)}`;
+}
+
+export default {
+  loadUserPoolInfo,
+  saveUserPoolInfo,
+  loadPoolInfo,
+  savePoolInfo,
+  userHasPoolInfo,
+  getUserWalletCount,
+  escapeMarkdown,
+  formatCurrency,
+  formatPercentage,
+  sleep,
+  isValidSolanaAddress,
+  truncateAddress
+};

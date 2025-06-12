@@ -1,37 +1,84 @@
-import TelegramBot from 'node-telegram-bot-api';
-import { BOT_TOKEN, AUTHORIZED_TELEGRAM_USERS } from './shared/config';
 import { initBot } from './telegram/bot';
+import * as dotenv from 'dotenv';
 
-// Print startup banner
-console.log('┌─────────────────────────────────────────────┐');
-console.log('│           PUMP.FUN BUNDLER BOT              │');
-console.log('│         Telegram-only Edition                │');
-console.log('└─────────────────────────────────────────────┘');
-console.log(`🤖 Starting Telegram bot...`);
-console.log(`🔒 Authorized users: ${AUTHORIZED_TELEGRAM_USERS.length}`);
+// Load environment variables
+dotenv.config();
 
-// Create and initialize the Telegram bot
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-initBot();
+// Store bot instance for cleanup
+let botInstance: any = null;
 
-console.log('✅ Bot is now running!');
-console.log('Press Ctrl+C to stop the bot.');
+/**
+ * Main application entry point
+ * Only initializes the Telegram bot
+ */
+async function main() {
+  // Print startup banner
+  console.log('┌─────────────────────────────────────────────┐');
+  console.log('│           PUMP.FUN BUNDLER BOT              │');
+  console.log('│         Telegram-only Edition                │');
+  console.log('└─────────────────────────────────────────────┘');
+  
+  console.log('🚀 Starting Pump.Fun Bundler Telegram Bot...');
+  
+  try {
+    // Initialize and start the Telegram bot
+    botInstance = await initBot();
+    
+    console.log('✅ Bot initialized successfully!');
+    console.log('Press Ctrl+C to stop the bot.');
+  } catch (error: any) {
+    console.error('❌ Failed to initialize bot:', error.message);
+    
+    if (error.code === 'ETELEGRAM' && error.response?.body?.error_code === 409) {
+      console.log('💡 Another bot instance is running. Please:');
+      console.log('   1. Kill any existing bot processes');
+      console.log('   2. Wait 30-60 seconds');
+      console.log('   3. Try again');
+    }
+    
+    process.exit(1);
+  }
+}
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (error: any) => {
-  console.error('Unhandled promise rejection:', error);
-});
+/**
+ * Graceful shutdown function
+ */
+async function gracefulShutdown(signal: string) {
+  console.log(`\n🛑 Received ${signal}, shutting down Telegram bot...`);
+  
+  if (botInstance && typeof botInstance.stopPolling === 'function') {
+    try {
+      if (botInstance.isPolling()) {
+        await botInstance.stopPolling();
+        console.log('✅ Bot polling stopped');
+      }
+    } catch (error) {
+      console.error('⚠️ Error stopping bot polling:', error);
+    }
+  }
+  
+  console.log('👋 Goodbye!');
+  process.exit(0);
+}
+
+// Setup graceful shutdown handlers
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Handle uncaught exceptions
-process.on('uncaughtException', (error: any) => {
-  console.error('Uncaught exception:', error);
+process.on('uncaughtException', (error) => {
+  console.error('💥 Uncaught Exception:', error);
+  gracefulShutdown('uncaughtException');
 });
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n🛑 Stopping bot...');
-  bot.stopPolling();
-  process.exit(0);
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('unhandledRejection');
 });
 
-export default bot;
+// Run the main function
+main().catch((error) => {
+  console.error('💥 Fatal error in main:', error);
+  process.exit(1);
+});

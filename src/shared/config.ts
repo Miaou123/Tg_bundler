@@ -11,6 +11,15 @@ dotenv.config();
 export const KEYPAIRS_DIR = path.join(__dirname, '..', '..', 'keypairs');
 export const KEY_INFO_PATH = path.join(__dirname, '..', '..', 'keyInfo.json');
 
+// User-specific path functions
+export function getUserKeypairPath(userId: number): string {
+  return path.join(KEYPAIRS_DIR, `user_${userId}.json`);
+}
+
+export function getUserKeyInfoPath(userId: number): string {
+  return path.join(KEYPAIRS_DIR, `keyInfo_${userId}.json`);
+}
+
 // Ensure directories exist
 if (!fs.existsSync(KEYPAIRS_DIR)) {
   fs.mkdirSync(KEYPAIRS_DIR, { recursive: true });
@@ -53,7 +62,7 @@ export const PUMP_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5u
 export const PUMPSWAP_PROGRAM_ID = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
 export const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 export const RayLiqPoolv4 = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
-export const global = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+export const global = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jaxnjf");
 export const mintAuthority = new PublicKey("TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM");
 export const MPL_TOKEN_METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 export const eventAuthority = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
