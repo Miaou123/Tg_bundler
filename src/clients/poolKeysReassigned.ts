@@ -3,11 +3,17 @@ import { Market } from '@openbook-dex/openbook';
 import { AccountInfo, PublicKey } from '@solana/web3.js';
 import { u8, u32, struct } from '@solana/buffer-layout';
 import { u64, publicKey } from '@solana/buffer-layout-utils';
-import { RayLiqPoolv4, connection, wallet } from '../../config';
+import { connection, wallet, RayLiqPoolv4 } from '../shared/config';
 import { ApiPoolInfoV4 } from "@raydium-io/raydium-sdk";
 
+// Openbook program ID
 const openbookProgram = new PublicKey('srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX');
 
+/**
+ * Get market account info
+ * @param marketId Market ID
+ * @returns Market account info
+ */
 async function getMarketInfo(marketId: PublicKey) {
   let reqs = 0;
   let marketInfo = await connection.getAccountInfo(marketId);
@@ -20,7 +26,6 @@ async function getMarketInfo(marketId: PublicKey) {
       break;
     } else if (reqs > 20) {
       console.log(`Could not get market info..`);
-
       return null;
     }
   }
@@ -28,6 +33,11 @@ async function getMarketInfo(marketId: PublicKey) {
   return marketInfo;
 }
 
+/**
+ * Decode market data
+ * @param marketInfo Market account info
+ * @returns Decoded market data
+ */
 async function getDecodedData(marketInfo: {
   executable?: boolean;
   owner?: PublicKey;
@@ -38,16 +48,31 @@ async function getDecodedData(marketInfo: {
   return Market.getLayout(openbookProgram).decode(marketInfo.data);
 }
 
+/**
+ * Get mint account info
+ * @param mint Mint address
+ * @returns Mint account info
+ */
 async function getMintData(mint: PublicKey) {
   return connection.getAccountInfo(mint);
 }
 
+/**
+ * Get mint decimals
+ * @param mintData Mint account data
+ * @returns Mint decimals
+ */
 async function getDecimals(mintData: AccountInfo<Buffer> | null) {
   if (!mintData) throw new Error('No mint data!');
-
   return SPL_MINT_LAYOUT.decode(mintData.data).decimals;
 }
 
+/**
+ * Get associated token account for owner
+ * @param mint Mint address
+ * @param publicKey Owner public key
+ * @returns Associated token account
+ */
 async function getOwnerAta(mint: { toBuffer: () => Uint8Array | Buffer }, publicKey: PublicKey) {
   const foundAta = PublicKey.findProgramAddressSync(
     [publicKey.toBuffer(), spl.TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
@@ -57,13 +82,23 @@ async function getOwnerAta(mint: { toBuffer: () => Uint8Array | Buffer }, public
   return foundAta;
 }
 
-function getVaultSigner(marketId: { toBuffer: any }, marketDeco: { vaultSignerNonce: { toString: () => any } }) {
+/**
+ * Get vault signer
+ * @param marketId Market ID
+ * @param marketDeco Decoded market data
+ * @returns Vault signer
+ */
+function getVaultSigner(marketId: { toBuffer: () => any }, marketDeco: { vaultSignerNonce: { toString: () => any } }) {
   const seeds = [marketId.toBuffer()];
   const seedsWithNonce = seeds.concat(Buffer.from([Number(marketDeco.vaultSignerNonce.toString())]), Buffer.alloc(7));
-
   return PublicKey.createProgramAddressSync(seedsWithNonce, openbookProgram);
 }
 
+/**
+ * Derive all pool keys for a given market
+ * @param marketId Market ID
+ * @returns Pool keys
+ */
 export async function derivePoolKeys(marketId: PublicKey) {
   const marketInfo = await getMarketInfo(marketId);
   if (!marketInfo) return null;
@@ -147,6 +182,11 @@ export async function derivePoolKeys(marketId: PublicKey) {
   return poolKeys;
 }
 
+/**
+ * Convert pool keys to API pool info format
+ * @param poolkeys Pool keys
+ * @returns API pool info
+ */
 export async function PoolKeysCorrector(poolkeys: IPoolKeys): Promise<ApiPoolInfoV4 | undefined> {
   return {
       id: poolkeys.id.toString(),
@@ -175,9 +215,12 @@ export async function PoolKeysCorrector(poolkeys: IPoolKeys): Promise<ApiPoolInf
       marketAsks: poolkeys.marketAsks.toString(),
       marketEventQueue: poolkeys.marketEventQueue.toString(),
       lookupTableAccount: PublicKey.default.toString()
-  }
+  };
 }
 
+/**
+ * Pool keys interface
+ */
 export interface IPoolKeys {
   keg?: PublicKey;
   version?: number;
@@ -211,6 +254,9 @@ export interface IPoolKeys {
   lookupTableAccount?: PublicKey;
 }
 
+/**
+ * SPL mint layout
+ */
 export const SPL_MINT_LAYOUT = struct<any>([
   u32('mintAuthorityOption'),
   publicKey('mintAuthority'),
@@ -221,6 +267,9 @@ export const SPL_MINT_LAYOUT = struct<any>([
   publicKey('freezeAuthority')
 ]);
 
+/**
+ * SPL account layout
+ */
 export const SPL_ACCOUNT_LAYOUT = struct<any>([
   publicKey('mint'),
   publicKey('owner'),
