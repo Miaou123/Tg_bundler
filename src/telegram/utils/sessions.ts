@@ -1,142 +1,137 @@
-import { UserSession } from '../../shared/types';
+// src/telegram/utils/sessions.ts
 
-// Store active user sessions
-const userSessions: Map<number, UserSession> = new Map();
+interface UserSession {
+  waitingFor?: string;
+  currentMenu?: string;
+  tempData?: any;
+}
+
+// In-memory session storage
+const userSessions = new Map<number, UserSession>();
 
 /**
- * Get a user's session, creating a new one if it doesn't exist
- * @param userId Telegram user ID
- * @returns User session object
+ * Set what the user is waiting for input on
+ * @param userId User ID
+ * @param waitingFor What the user is waiting for
  */
-export function getUserSession(userId: number): UserSession {
+export function setWaitingFor(userId: number, waitingFor: string): void {
   if (!userSessions.has(userId)) {
     userSessions.set(userId, {});
   }
-  return userSessions.get(userId)!;
+  const session = userSessions.get(userId)!;
+  session.waitingFor = waitingFor;
+  userSessions.set(userId, session);
 }
 
 /**
- * Clear a user's session
- * @param userId Telegram user ID
+ * Get what the user is waiting for
+ * @param userId User ID
+ * @returns What the user is waiting for, or null
+ */
+export function getWaitingFor(userId: number): string | null {
+  const session = userSessions.get(userId);
+  return session?.waitingFor || null;
+}
+
+/**
+ * Clear what the user is waiting for
+ * @param userId User ID
+ */
+export function clearWaitingFor(userId: number): void {
+  const session = userSessions.get(userId);
+  if (session) {
+    delete session.waitingFor;
+    userSessions.set(userId, session);
+  }
+}
+
+/**
+ * Set the current menu for the user
+ * @param userId User ID
+ * @param menu Current menu
+ */
+export function setCurrentMenu(userId: number, menu: string): void {
+  if (!userSessions.has(userId)) {
+    userSessions.set(userId, {});
+  }
+  const session = userSessions.get(userId)!;
+  session.currentMenu = menu;
+  userSessions.set(userId, session);
+}
+
+/**
+ * Get the current menu for the user
+ * @param userId User ID
+ * @returns Current menu, or null
+ */
+export function getCurrentMenu(userId: number): string | null {
+  const session = userSessions.get(userId);
+  return session?.currentMenu || null;
+}
+
+/**
+ * Store temporary data for the user
+ * @param userId User ID
+ * @param key Data key
+ * @param value Data value
+ */
+export function setTempData(userId: number, key: string, value: any): void {
+  if (!userSessions.has(userId)) {
+    userSessions.set(userId, {});
+  }
+  const session = userSessions.get(userId)!;
+  if (!session.tempData) {
+    session.tempData = {};
+  }
+  session.tempData[key] = value;
+  userSessions.set(userId, session);
+}
+
+/**
+ * Get temporary data for the user
+ * @param userId User ID
+ * @param key Data key
+ * @returns Temporary data, or null
+ */
+export function getTempData(userId: number, key: string): any | null {
+  const session = userSessions.get(userId);
+  return session?.tempData?.[key] || null;
+}
+
+/**
+ * Clear all temporary data for the user
+ * @param userId User ID
+ */
+export function clearTempData(userId: number): void {
+  const session = userSessions.get(userId);
+  if (session) {
+    delete session.tempData;
+    userSessions.set(userId, session);
+  }
+}
+
+/**
+ * Clear the entire user session
+ * @param userId User ID
  */
 export function clearUserSession(userId: number): void {
   userSessions.delete(userId);
 }
 
 /**
- * Update a specific field in the user's session
- * @param userId Telegram user ID
- * @param field Field to update
- * @param value New value
+ * Get the entire user session
+ * @param userId User ID
+ * @returns User session, or empty object
  */
-export function updateUserSession(userId: number, field: keyof UserSession, value: any): void {
-  const session = getUserSession(userId);
-  session[field] = value;
+export function getUserSession(userId: number): UserSession {
+  return userSessions.get(userId) || {};
 }
 
 /**
- * Set waiting state for user session
- * @param userId Telegram user ID
- * @param waitingFor What the session is waiting for
- * @param additionalData Any additional data to store
+ * Check if user has an active session
+ * @param userId User ID
+ * @returns True if user has active session
  */
-export function setWaitingFor(userId: number, waitingFor: string, additionalData?: any): void {
-  const session = getUserSession(userId);
-  session.waitingFor = waitingFor;
-  
-  if (additionalData) {
-    session.data = {
-      ...(session.data || {}),
-      ...additionalData
-    };
-  }
+export function hasUserSession(userId: number): boolean {
+  return userSessions.has(userId);
 }
-
-/**
- * Add data to the user session
- * @param userId Telegram user ID
- * @param key Data key
- * @param value Data value
- */
-export function addSessionData(userId: number, key: string, value: any): void {
-  const session = getUserSession(userId);
-  
-  if (!session.data) {
-    session.data = {};
-  }
-  
-  session.data[key] = value;
-}
-
-/**
- * Get data from user session
- * @param userId Telegram user ID
- * @param key Data key
- * @returns Data value or undefined if not found
- */
-export function getSessionData(userId: number, key: string): any {
-  const session = getUserSession(userId);
-  
-  if (!session.data) {
-    return undefined;
-  }
-  
-  return session.data[key];
-}
-
-/**
- * Check if a session is waiting for input
- * @param userId Telegram user ID
- * @returns Whether the session is waiting for input
- */
-export function isWaitingForInput(userId: number): boolean {
-  const session = getUserSession(userId);
-  return !!session.waitingFor;
-}
-
-/**
- * Store input in the session
- * @param userId Telegram user ID
- * @param input User input
- */
-export function storeInput(userId: number, input: string): void {
-  const session = getUserSession(userId);
-  
-  if (!session.inputs) {
-    session.inputs = [];
-  }
-  
-  session.inputs.push(input);
-}
-
-/**
- * Get all stored inputs
- * @param userId Telegram user ID
- * @returns Array of inputs or empty array if none
- */
-export function getAllInputs(userId: number): string[] {
-  const session = getUserSession(userId);
-  return session.inputs || [];
-}
-
-/**
- * Clear all inputs for a user
- * @param userId Telegram user ID
- */
-export function clearInputs(userId: number): void {
-  const session = getUserSession(userId);
-  session.inputs = [];
-}
-
-export default {
-  getUserSession,
-  clearUserSession,
-  updateUserSession,
-  setWaitingFor,
-  addSessionData,
-  getSessionData,
-  isWaitingForInput,
-  storeInput,
-  getAllInputs,
-  clearInputs
-};

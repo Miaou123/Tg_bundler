@@ -1,5 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { getUserSession, clearUserSession, isWaitingForInput } from '../utils/sessions';
+import { getUserSession, clearUserSession, getWaitingFor } from '../utils/sessions';
 import { createMainMenuKeyboard, createPreLaunchKeyboard } from '../utils/keyboards';
 import { MAIN_MENU_MESSAGE, PRE_LAUNCH_MESSAGE, formatMessage } from '../utils/messages';
 import { ERRORS } from '../../shared/constants';
@@ -34,7 +34,7 @@ export function initHandlers(bot: TelegramBot): void {
     
     try {
       // Handle active sessions with input waiting
-      if (isWaitingForInput(userId)) {
+      if (getWaitingFor(userId)) {
         await handleWaitingInput(bot, chatId, userId, text);
         return;
       }

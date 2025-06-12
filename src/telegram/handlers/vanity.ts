@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { UserSession } from '../../shared/types';
-import { setWaitingFor, addSessionData, getSessionData } from '../utils/sessions';
+import { setWaitingFor, setTempData, getTempData } from '../utils/sessions';
 import { createVanityPatternTypeKeyboard } from '../utils/keyboards';
 import { VANITY_ADDRESS_MESSAGE, VANITY_DIFFICULTY_MESSAGE, formatMessage, processingMessage, successMessage, errorMessage } from '../utils/messages';
 import { showMainMenu } from './index';
@@ -120,11 +120,11 @@ async function handleVanityPatternType(
       return;
     }
     
-    addSessionData(userId, 'isPrefix', isPrefix);
+    setTempData(userId, 'isPrefix', isPrefix);
     
     if (pattern) {
       // Quick pump pattern
-      addSessionData(userId, 'pattern', pattern);
+      setTempData(userId, 'pattern', pattern);
       await executeVanityGeneration(bot, chatId, userId);
     } else {
       // Ask for pattern
@@ -175,7 +175,7 @@ async function handleVanityPattern(
       }
     }
     
-    addSessionData(userId, 'pattern', text);
+    setTempData(userId, 'pattern', text);
     await executeVanityGeneration(bot, chatId, userId);
     
   } catch (error) {
@@ -196,8 +196,8 @@ async function executeVanityGeneration(
   userId: number
 ): Promise<void> {
   try {
-    const pattern = getSessionData(userId, 'pattern');
-    const isPrefix = getSessionData(userId, 'isPrefix');
+    const pattern = getTempData(userId, 'pattern');
+    const isPrefix = getTempData(userId, 'isPrefix');
     
     await bot.sendMessage(
       chatId,

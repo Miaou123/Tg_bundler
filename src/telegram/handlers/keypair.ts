@@ -1,3 +1,5 @@
+// src/telegram/handlers/keypair.ts
+
 import TelegramBot from 'node-telegram-bot-api';
 
 /**
@@ -18,7 +20,9 @@ export async function handleCreateKeypairsCheck(bot: TelegramBot, chatId: number
     
     if (walletInfo?.wallets) {
       walletInfo.wallets.slice(0, 5).forEach((wallet: any, index: number) => {
-        message += `Wallet ${index + 1}: \`${wallet.publicKey}\`\n`;
+        // Escape the wallet address for MarkdownV2
+        const escapedAddress = wallet.publicKey.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+        message += `Wallet ${index + 1}: \`${escapedAddress}\`\n`;
       });
       
       if (walletInfo.wallets.length > 5) {
@@ -67,28 +71,16 @@ export async function handleKeypairCreation(bot: TelegramBot, chatId: number, us
     }
     
     const successMessage = createNew 
-      ? `✅ **SUCCESS\\!**\n\n🔑 Created ${wallets.length} new keypairs\n📁 Saved to user_${userId}\\.json\n📋 Updated keyInfo_${userId}\\.json\n\n⚠️ **Note:** Previous LUT cleared \\- you need to create a new LUT for these wallets`
-      : `✅ **SUCCESS\\!**\n\n📁 Loaded ${wallets.length} existing keypairs\n📋 Updated keyInfo_${userId}\\.json`;
+      ? `✅ **SUCCESS\\!**\n\n🔑 Created ${wallets.length} new keypairs\n📁 Saved to user\\_${userId}\\.json\n📋 Updated keyInfo\\_${userId}\\.json\n\n⚠️ **Note:** Previous LUT cleared \\- you need to create a new LUT for these wallets`
+      : `✅ **SUCCESS\\!**\n\n📁 Loaded ${wallets.length} existing keypairs\n📋 Ready to use with your existing setup`;
     
     await bot.sendMessage(chatId, successMessage, { parse_mode: 'MarkdownV2' });
-    
-    // Show wallet info
-    let walletInfo = '\n**WALLET INFO:**\n\n';
-    wallets.slice(0, 5).forEach((wallet, index) => {
-      walletInfo += `Wallet ${index + 1}: \`${wallet.publicKey.toString()}\`\n`;
-    });
-    
-    if (wallets.length > 5) {
-      walletInfo += `\n\\.\\.\\. and ${wallets.length - 5} more wallets`;
-    }
-    
-    await bot.sendMessage(chatId, walletInfo, { parse_mode: 'MarkdownV2' });
     
     // Return to main menu
     await returnToMainMenu(bot, chatId);
     
   } catch (error: any) {
-    console.error('Error in keypair creation:', error);
+    console.error('Error in keypair creation/loading:', error);
     const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
     await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
     

@@ -111,8 +111,17 @@ async function handleCallbackQuery(bot: TelegramBot, chatId: number, userId: num
       await prelaunchHandlers.handleCreateLUTFlow(bot, chatId, userId);
       break;
       
-    case 'extend_lut':
+    case 'extend_lut':  // This is now "Set Contract Address"
       await prelaunchHandlers.handleExtendLUTFlow(bot, chatId, userId);
+      break;
+      
+    // NEW: Contract address selection handlers
+    case 'contract_vanity':
+      await prelaunchHandlers.handleVanityContractFlow(bot, chatId, userId);
+      break;
+      
+    case 'contract_random':
+      await prelaunchHandlers.handleRandomContractFlow(bot, chatId, userId);
       break;
       
     case 'simulate_buys':
@@ -320,15 +329,52 @@ export async function initBot(): Promise<TelegramBot> {
     const { getUserSession, clearUserSession } = await import('./utils/sessions');
     const session = getUserSession(userId);
     
+    // EXISTING HANDLERS (you already have these)
     if (session.waitingFor === 'lut_tip_input') {
       clearUserSession(userId);
       await prelaunchHandlers.handleCreateLUTWithTip(bot, chatId, userId, text);
       return;
     }
-    
-    if (session.waitingFor === 'extend_lut_tip_input') {
+
+    if (session.waitingFor === 'vanity_private_key_input') {
       clearUserSession(userId);
-      await prelaunchHandlers.handleExtendLUTWithTip(bot, chatId, userId, text);
+      await prelaunchHandlers.handleVanityPrivateKeyInput(bot, chatId, userId, text);
+      return;
+    }
+    
+    if (session.waitingFor === 'vanity_contract_tip_input') {
+      clearUserSession(userId);
+      await prelaunchHandlers.handleVanityContractWithTip(bot, chatId, userId, text);
+      return;
+    }
+    
+    if (session.waitingFor === 'random_contract_tip_input') {
+      clearUserSession(userId);
+      await prelaunchHandlers.handleRandomContractWithTip(bot, chatId, userId, text);
+      return;
+    }
+    
+    if (session.waitingFor === 'send_sol_tip_input') {
+      clearUserSession(userId);
+      await prelaunchHandlers.handleSendSOLWithTip(bot, chatId, userId, text);
+      return;
+    }
+    
+    if (session.waitingFor === 'reclaim_sol_tip_input') {
+      clearUserSession(userId);
+      await prelaunchHandlers.handleReclaimSOLWithTip(bot, chatId, userId, text);
+      return;
+    }
+  
+    if (session.waitingFor === 'send_sol_tip_input') {
+      clearUserSession(userId);
+      await prelaunchHandlers.handleSendSOLWithTip(bot, chatId, userId, text);
+      return;
+    }
+    
+    if (session.waitingFor === 'reclaim_sol_tip_input') {
+      clearUserSession(userId);
+      await prelaunchHandlers.handleReclaimSOLWithTip(bot, chatId, userId, text);
       return;
     }
     

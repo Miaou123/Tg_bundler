@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { UserSession } from '../../shared/types';
-import { setWaitingFor, addSessionData, getSessionData } from '../utils/sessions';
+import { setWaitingFor, setTempData, getTempData } from '../utils/sessions';
 import { createWalletSelectionKeyboard, createPercentageKeyboard, createSlippageKeyboard } from '../utils/keyboards';
 import { consoleRequiredMessage, formatMessage, processingMessage, successMessage, errorMessage } from '../utils/messages';
 import { showMainMenu } from './index';
@@ -236,7 +236,7 @@ async function handleSellSelectionMode(
       return;
     }
     
-    addSessionData(userId, 'selectionMode', mode);
+    setTempData(userId, 'selectionMode', mode);
     
     await bot.sendMessage(
       chatId,
@@ -282,7 +282,7 @@ async function handleSellPercentage(
       return;
     }
     
-    addSessionData(userId, 'supplyPercent', percentage);
+    setTempData(userId, 'supplyPercent', percentage);
     
     await bot.sendMessage(
       chatId,
@@ -331,7 +331,7 @@ async function handleSellSlippage(
       }
     }
     
-    addSessionData(userId, 'slippagePercent', slippage);
+    setTempData(userId, 'slippagePercent', slippage);
     
     await bot.sendMessage(chatId, '💰 Enter Jito tip in Sol (Ex. 0.01):');
     setWaitingFor(userId, WAITING_FOR.JITO_TIP);
@@ -375,7 +375,7 @@ async function handleBuySelectionMode(
       return;
     }
     
-    addSessionData(userId, 'selectionMode', mode);
+    setTempData(userId, 'selectionMode', mode);
     
     await bot.sendMessage(chatId, 'Total SOL amount to spend (Ex. 1.5):');
     setWaitingFor(userId, WAITING_FOR.BUY_TOTAL_SOL);
@@ -406,7 +406,7 @@ async function handleBuyTotalSOL(
       return;
     }
     
-    addSessionData(userId, 'totalSOL', totalSOL);
+    setTempData(userId, 'totalSOL', totalSOL);
     
     await bot.sendMessage(
       chatId,
@@ -455,7 +455,7 @@ async function handleBuySlippage(
       }
     }
     
-    addSessionData(userId, 'slippagePercent', slippage);
+    setTempData(userId, 'slippagePercent', slippage);
     
     await bot.sendMessage(chatId, '💰 Enter Jito tip in Sol (Ex. 0.01):');
     setWaitingFor(userId, WAITING_FOR.JITO_TIP);
@@ -488,7 +488,7 @@ async function handleJitoTip(
       return;
     }
     
-    addSessionData(userId, 'jitoTipLamports', Math.floor(jitoTip * 1e9)); // Convert to lamports
+    setTempData(userId, 'jitoTipLamports', Math.floor(jitoTip * 1e9)); // Convert to lamports
     
     // Execute the appropriate function based on currentFunction
     const currentFunction = session.currentFunction;
@@ -535,10 +535,10 @@ async function executeSellOperation(
     }
     
     const mintAddress = poolInfo.mint;
-    const selectionMode = getSessionData(userId, 'selectionMode');
-    const supplyPercent = getSessionData(userId, 'supplyPercent');
-    const slippagePercent = getSessionData(userId, 'slippagePercent');
-    const jitoTipLamports = getSessionData(userId, 'jitoTipLamports');
+    const selectionMode = getTempData(userId, 'selectionMode');
+    const supplyPercent = getTempData(userId, 'supplyPercent');
+    const slippagePercent = getTempData(userId, 'slippagePercent');
+    const jitoTipLamports = getTempData(userId, 'jitoTipLamports');
     
     // For now, show what would be executed
     await bot.sendMessage(chatId, 
@@ -588,10 +588,10 @@ async function executeBuyOperation(
     }
     
     const mintAddress = poolInfo.mint;
-    const selectionMode = getSessionData(userId, 'selectionMode');
-    const totalSOL = getSessionData(userId, 'totalSOL');
-    const slippagePercent = getSessionData(userId, 'slippagePercent');
-    const jitoTipLamports = getSessionData(userId, 'jitoTipLamports');
+    const selectionMode = getTempData(userId, 'selectionMode');
+    const totalSOL = getTempData(userId, 'totalSOL');
+    const slippagePercent = getTempData(userId, 'slippagePercent');
+    const jitoTipLamports = getTempData(userId, 'jitoTipLamports');
     
     // For now, show what would be executed
     await bot.sendMessage(chatId, 

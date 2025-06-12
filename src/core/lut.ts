@@ -12,6 +12,7 @@ import {
     SYSVAR_RENT_PUBKEY 
   } from '@solana/web3.js';
   import fs from 'fs';
+  import path from 'path';
   import { connection, payer, PUMP_PROGRAM } from '../shared/config';
   import { searcherClient } from "../clients/jito";
   import { Bundle as JitoBundle } from 'jito-ts/dist/sdk/block-engine/types.js';
@@ -20,8 +21,31 @@ import {
   import { loadUserKeypairs } from './keys';
   import * as spl from '@solana/spl-token';
   import bs58 from 'bs58';
-  import { loadUserPoolInfo, saveUserPoolInfo } from '../shared/utils';
+  import { loadUserPoolInfo, saveUserPoolInfo, getUserKeyInfoPath } from '../shared/utils';
   
+  /**
+   * Create user-specific metadata file
+   * @param userId User ID
+   * @param mintAddress Mint address
+   */
+  function createUserMetadataFile(userId: number, mintAddress: string): void {
+    const metadataPath = path.join(path.dirname(getUserKeyInfoPath(userId)), `metadata_${userId}_${mintAddress.slice(0, 8)}.json`);
+    
+    const emptyMetadata = {
+      name: "",
+      symbol: "", 
+      description: "",
+      image: "",
+      showName: true,
+      twitter: "",
+      telegram: "", 
+      website: ""
+    };
+    
+    fs.writeFileSync(metadataPath, JSON.stringify(emptyMetadata, null, 2));
+    console.log(`📄 Created metadata file: ${metadataPath}`);
+  }
+
   /**
    * Create a new user-specific Lookup Table
    * @param userId Telegram user ID
@@ -110,9 +134,9 @@ import {
   export async function extendUserLUT(userId: number, jitoTipAmount?: number, vanityPK?: string | null): Promise<void> {
     // Read existing data from user's pool info
     const poolInfo = loadUserPoolInfo(userId);
-  
+
     const bundledTxns1: VersionedTransaction[] = [];
-  
+
     // -------- step 2: get all LUT addresses --------
     const accounts: PublicKey[] = []; // Array with all new keys to push to the new LUT
     
@@ -121,15 +145,16 @@ import {
     }
     
     const lut = new PublicKey(poolInfo.addressLUT.toString());
-  
+
+    // -------- FIXED: Use exact same approach as old working code --------
     const lookupTableAccount = (
         await connection.getAddressLookupTable(lut)
     ).value;
-  
+
     if (lookupTableAccount == null) {
         throw new Error("Lookup table account not found!");
     }
-  
+
     // -------- step 3: handle vanity address if provided --------
     let mintKp: Keypair;
     if (vanityPK) {
@@ -140,38 +165,69 @@ import {
         console.log("No vanity, using random address");
         mintKp = Keypair.generate();
     }
-  
-    // -------- step 4: get all related addresses --------
+
+    // Write mint info to json
+    console.log(`Mint: ${mintKp.publicKey.toString()}`);
+    poolInfo.mint = mintKp.publicKey.toString();
+    poolInfo.mintPk = bs58.encode(mintKp.secretKey);
+    saveUserPoolInfo(userId, poolInfo);
+
+    // Create empty metadata file for this user and mint
+    createUserMetadataFile(userId, mintKp.publicKey.toString());
+
+    // -------- step 4: get all related addresses (EXACT SAME AS OLD CODE) --------
+    
+    // Define constants exactly like old code
+    const mintAuthority = new PublicKey("TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM");
+    const MPL_TOKEN_METADATA_PROGRAM_ID = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+    const global = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+    
+    // Use manual PDA derivation instead of program.programId (EXACT SAME AS OLD CODE)
     const [bondingCurve] = PublicKey.findProgramAddressSync(
         [Buffer.from("bonding-curve"), mintKp.publicKey.toBuffer()],
         PUMP_PROGRAM
     );
-  
+    
+    const [metadata] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from("metadata"),
+          MPL_TOKEN_METADATA_PROGRAM_ID.toBuffer(),
+          mintKp.publicKey.toBuffer(),
+        ],
+        MPL_TOKEN_METADATA_PROGRAM_ID,
+    );
+    
     const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
         [
-            bondingCurve.toBuffer(),
-            spl.TOKEN_PROGRAM_ID.toBuffer(),
-            mintKp.publicKey.toBuffer(),
+          bondingCurve.toBuffer(),
+          spl.TOKEN_PROGRAM_ID.toBuffer(),
+          mintKp.publicKey.toBuffer(),
         ],
         spl.ASSOCIATED_TOKEN_PROGRAM_ID,
     );
-  
-    // Push pump.fun related addresses first
+    
+    const eventAuthority = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1");
+    const feeRecipient = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
+
+    // EXACT SAME ORDER AND ACCOUNTS AS OLD CODE
     accounts.push(
+        spl.ASSOCIATED_TOKEN_PROGRAM_ID,
+        spl.TOKEN_PROGRAM_ID,
+        MPL_TOKEN_METADATA_PROGRAM_ID,
+        mintAuthority,
+        global,
         PUMP_PROGRAM,
-        new PublicKey('11111111111111111111111111111112'),
-        new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'),
-        new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'),
-        new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf'),
-        new PublicKey('TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM'),
-        new PublicKey('Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1'),
-        new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM'),
-        bondingCurve,
+        metadata,                    // This was missing in new code!
         associatedBondingCurve,
+        bondingCurve,
+        eventAuthority,
+        SystemProgram.programId,
+        SYSVAR_RENT_PUBKEY,
         mintKp.publicKey,
+        feeRecipient,
     );
-  
-    // Loop through each user's keypair and push its pubkey and ATAs to the accounts array
+
+    // Loop through each keypair and push its pubkey and ATAs to the accounts array
     const keypairs = loadUserKeypairs(userId);
     for (const keypair of keypairs) {
         const ataToken = await spl.getAssociatedTokenAddress(
@@ -180,39 +236,39 @@ import {
         );
         accounts.push(keypair.publicKey, ataToken);
     }
-  
-    // Push wallet and payer ATAs and pubkey JUST IN CASE
+
+    // Push wallet and payer ATAs and pubkey JUST IN CASE (EXACT SAME AS OLD CODE)
     const ataTokenwall = await spl.getAssociatedTokenAddress(
         mintKp.publicKey,
-        payer.publicKey,
+        payer.publicKey,  // Use payer instead of wallet
     );
-  
+
     const ataTokenpayer = await spl.getAssociatedTokenAddress(
         mintKp.publicKey,
         payer.publicKey,
     );
-  
-    // Add just in case
+
+    // Add just in case (EXACT SAME AS OLD CODE)
     accounts.push(
-        payer.publicKey,
+        payer.publicKey,  // Use payer instead of wallet
         payer.publicKey,
         ataTokenwall,
         ataTokenpayer,
         lut, 
         spl.NATIVE_MINT, 
     );
-  
+
     // -------- step 5: push LUT addresses to a txn --------
     const extendLUTixs1: TransactionInstruction[] = [];
     const extendLUTixs2: TransactionInstruction[] = [];
     const extendLUTixs3: TransactionInstruction[] = [];
     const extendLUTixs4: TransactionInstruction[] = [];
-  
+
     // Chunk accounts array into groups of 30
     const accountChunks = Array.from({ length: Math.ceil(accounts.length / 30) }, (v, i) => accounts.slice(i * 30, (i + 1) * 30));
     console.log("Num of chunks:", accountChunks.length);
     console.log("Num of accounts:", accounts.length);
-  
+
     for (let i = 0; i < accountChunks.length; i++) {
         const chunk = accountChunks[i];
         const extendInstruction = AddressLookupTableProgram.extendLookupTable({
@@ -236,45 +292,34 @@ import {
         }
     }
     
-    // Add the jito tip to the last txn
-    if (jitoTipAmount) {
-      const tipAmount = jitoTipAmount * LAMPORTS_PER_SOL;
-      extendLUTixs4.push(
+    // Add the jito tip to the last txn (EXACT SAME AS OLD CODE)
+    const tipAmount = jitoTipAmount ? jitoTipAmount * LAMPORTS_PER_SOL : 0.01 * LAMPORTS_PER_SOL;
+    extendLUTixs4.push(
         SystemProgram.transfer({
             fromPubkey: payer.publicKey,
             toPubkey: getRandomTipAccount(),
             lamports: BigInt(tipAmount),
         })
-      );
-    } else {
-      const defaultTipAmount = 0.01 * LAMPORTS_PER_SOL;
-      extendLUTixs4.push(
-        SystemProgram.transfer({
-            fromPubkey: payer.publicKey,
-            toPubkey: getRandomTipAccount(),
-            lamports: BigInt(defaultTipAmount),
-        })
-      );
-    }
-  
-    // -------- step 6: seperate into 2 different bundles to complete all txns --------
+    );
+
+    // -------- step 6: separate into 4 different bundles to complete all txns --------
     const { blockhash: block1 } = await connection.getLatestBlockhash();
-  
+
     const extend1 = await buildTxn(extendLUTixs1, block1, lookupTableAccount);
     const extend2 = await buildTxn(extendLUTixs2, block1, lookupTableAccount);
     const extend3 = await buildTxn(extendLUTixs3, block1, lookupTableAccount);
     const extend4 = await buildTxn(extendLUTixs4, block1, lookupTableAccount);
-  
+
     bundledTxns1.push(
         extend1,
         extend2,
         extend3,
         extend4,
     );
-  
+
     // -------- step 7: send bundle --------
     await sendBundle(bundledTxns1);
-  
+
     // Update user's pool info with extend info
     poolInfo.lutExtendedAt = new Date().toISOString();
     if (vanityPK) {
@@ -286,7 +331,7 @@ import {
   }
   
   /**
-   * Build a versioned transaction
+   * Build a versioned transaction (EXACT SAME AS OLD CODE)
    * @param extendLUTixs Instructions to include in the transaction
    * @param blockhash Recent blockhash
    * @param lut Lookup table account
@@ -317,7 +362,7 @@ import {
   }
   
   /**
-   * Send a bundle of transactions to Jito
+   * Send a bundle of transactions to Jito (EXACT SAME AS OLD CODE)
    * @param bundledTxns Transactions to send
    * @returns Promise<string | null> Bundle ID or null if failed
    */

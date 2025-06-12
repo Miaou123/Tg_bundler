@@ -1,4 +1,9 @@
+// src/telegram/handlers/prelaunch.ts
+
 import TelegramBot from 'node-telegram-bot-api';
+import { extendUserLUT } from '../../core/lut';
+import { simulateUserBuys, writeBuysToUserFile } from '../../core/simulation';
+import { sendSimulationSOL, reclaimUserSOL } from '../../core/funding';
 
 /**
  * Check if user has LUT and show appropriate options
@@ -83,7 +88,7 @@ export async function handleCreateLUTFlow(bot: TelegramBot, chatId: number, user
 }
 
 /**
- * Handle LUT extend flow
+ * Handle contract address setup flow
  */
 export async function handleExtendLUTFlow(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   // Check if user has LUT first
@@ -92,7 +97,7 @@ export async function handleExtendLUTFlow(bot: TelegramBot, chatId: number, user
   const fs = require('fs');
   
   if (!userHasKeypairs(userId)) {
-    await bot.sendMessage(chatId, '❌ You need to create keypairs first before extending LUT\\.', { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(chatId, '❌ You need to create keypairs first\\.', { parse_mode: 'MarkdownV2' });
     return;
   }
   
@@ -110,14 +115,26 @@ export async function handleExtendLUTFlow(bot: TelegramBot, chatId: number, user
   
   await bot.sendMessage(
     chatId,
-    '📦 **EXTEND LOOKUP TABLE**\n\n' +
-    'Please enter the Jito tip amount in SOL \\(e\\.g\\. 0\\.01\\):',
-    { parse_mode: 'MarkdownV2' }
+    '📦 **SET CONTRACT ADDRESS**\n\n' +
+    'Choose how to set your token contract address:\n\n' +
+    '🎯 **Vanity Address:** Import your custom private key\n' +
+    '🎲 **Random Address:** Generate a new random address\n\n' +
+    'Which option do you prefer?',
+    { 
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '🎯 Use Vanity Address', callback_data: 'contract_vanity' },
+            { text: '🎲 Generate Random', callback_data: 'contract_random' }
+          ],
+          [
+            { text: '🔙 Back', callback_data: 'pre_launch' }
+          ]
+        ]
+      },
+      parse_mode: 'MarkdownV2' 
+    }
   );
-  
-  // Set user session to wait for tip input
-  const { setWaitingFor } = await import('../utils/sessions');
-  setWaitingFor(userId, 'extend_lut_tip_input');
 }
 
 /**
@@ -154,9 +171,78 @@ export async function handleCreateLUTWithTip(bot: TelegramBot, chatId: number, u
 }
 
 /**
- * Handle LUT extend with tip
+ * Handle vanity contract address flow
  */
-export async function handleExtendLUTWithTip(bot: TelegramBot, chatId: number, userId: number, tipText: string): Promise<void> {
+export async function handleVanityContractFlow(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
+  await bot.sendMessage(
+    chatId,
+    '🎯 **VANITY CONTRACT ADDRESS**\n\n' +
+    'Please enter your vanity private key \\(in base58 format\\):\n\n' +
+    '⚠️ **Important:** Make sure this is a valid base58 private key\\!',
+    { parse_mode: 'MarkdownV2' }
+  );
+  
+  // Set user session to wait for private key input
+  const { setWaitingFor } = await import('../utils/sessions');
+  setWaitingFor(userId, 'vanity_private_key_input');
+}
+
+/**
+ * Handle random contract address flow
+ */
+export async function handleRandomContractFlow(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
+  await bot.sendMessage(
+    chatId,
+    '🎲 **RANDOM CONTRACT ADDRESS**\n\n' +
+    'Please enter the Jito tip amount in SOL \\(e\\.g\\. 0\\.01\\):',
+    { parse_mode: 'MarkdownV2' }
+  );
+  
+  // Set user session to wait for tip input
+  const { setWaitingFor } = await import('../utils/sessions');
+  setWaitingFor(userId, 'random_contract_tip_input');
+}
+
+/**
+ * Handle vanity private key input
+ */
+export async function handleVanityPrivateKeyInput(bot: TelegramBot, chatId: number, userId: number, privateKey: string): Promise<void> {
+  try {
+    // Validate the private key format
+    const bs58 = require('bs58');
+    
+    try {
+      const decoded = bs58.decode(privateKey);
+      if (decoded.length !== 64) {
+        throw new Error('Invalid key length');
+      }
+    } catch (error) {
+      await bot.sendMessage(chatId, '❌ Invalid private key format\\. Please enter a valid base58 private key:', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(
+      chatId,
+      '✅ **VALID PRIVATE KEY**\n\n' +
+      'Please enter the Jito tip amount in SOL \\(e\\.g\\. 0\\.01\\):',
+      { parse_mode: 'MarkdownV2' }
+    );
+    
+    // Store the private key temporarily and wait for tip input
+    const { setTempData, setWaitingFor } = await import('../utils/sessions');
+    setTempData(userId, 'vanity_private_key', privateKey);
+    setWaitingFor(userId, 'vanity_contract_tip_input');
+    
+  } catch (error: any) {
+    console.error('Error validating private key:', error);
+    await bot.sendMessage(chatId, '❌ Error validating private key\\. Please try again:', { parse_mode: 'MarkdownV2' });
+  }
+}
+
+/**
+ * Handle vanity contract with tip
+ */
+export async function handleVanityContractWithTip(bot: TelegramBot, chatId: number, userId: number, tipText: string): Promise<void> {
   try {
     const tipAmount = parseFloat(tipText);
     if (isNaN(tipAmount) || tipAmount <= 0) {
@@ -164,20 +250,64 @@ export async function handleExtendLUTWithTip(bot: TelegramBot, chatId: number, u
       return;
     }
     
-    await bot.sendMessage(chatId, '⏳ Extending Lookup Table...');
+    // Get the stored private key
+    const { getTempData, clearTempData } = await import('../utils/sessions');
+    const vanityPrivateKey = getTempData(userId, 'vanity_private_key');
     
-    // Call the core LUT extend function
-    const { extendUserLUT } = await import('../../core/lut');
-    await extendUserLUT(userId, tipAmount);
+    if (!vanityPrivateKey) {
+      await bot.sendMessage(chatId, '❌ Private key not found\\. Please start over\\.', { parse_mode: 'MarkdownV2' });
+      await returnToPreLaunchMenu(bot, chatId);
+      return;
+    }
+    
+    await bot.sendMessage(chatId, '⏳ Setting up contract with vanity address...');
+    
+    // Call the core LUT extend function with vanity key
+    await extendUserLUT(userId, tipAmount, vanityPrivateKey);
+    
+    // Clear temporary data
+    clearTempData(userId);
     
     const tipString = tipAmount.toString().replace(/\./g, '\\.');
-    await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n📦 Lookup Table extended successfully\n💰 Jito tip: ${tipString} SOL`, { parse_mode: 'MarkdownV2' });
+    await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n🎯 Contract address set with vanity key\n💰 Jito tip: ${tipString} SOL`, { parse_mode: 'MarkdownV2' });
     
-    // Return to pre-launch menu instead of main menu
+    // Return to pre-launch menu
     await returnToPreLaunchMenu(bot, chatId);
     
   } catch (error: any) {
-    console.error('Error in LUT extension:', error);
+    console.error('Error in vanity contract setup:', error);
+    const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
+    await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+    
+    // Return to pre-launch menu on error
+    await returnToPreLaunchMenu(bot, chatId);
+  }
+}
+
+/**
+ * Handle random contract with tip
+ */
+export async function handleRandomContractWithTip(bot: TelegramBot, chatId: number, userId: number, tipText: string): Promise<void> {
+  try {
+    const tipAmount = parseFloat(tipText);
+    if (isNaN(tipAmount) || tipAmount <= 0) {
+      await bot.sendMessage(chatId, '❌ Invalid tip amount\\. Please enter a valid number \\(e\\.g\\. 0\\.01\\):', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(chatId, '⏳ Setting up contract with random address...');
+    
+    // Call the core LUT extend function without vanity key (null = random)
+    await extendUserLUT(userId, tipAmount, null);
+    
+    const tipString = tipAmount.toString().replace(/\./g, '\\.');
+    await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n🎲 Contract address set with random key\n💰 Jito tip: ${tipString} SOL`, { parse_mode: 'MarkdownV2' });
+    
+    // Return to pre-launch menu
+    await returnToPreLaunchMenu(bot, chatId);
+    
+  } catch (error: any) {
+    console.error('Error in random contract setup:', error);
     const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
     await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
     
@@ -190,30 +320,225 @@ export async function handleExtendLUTWithTip(bot: TelegramBot, chatId: number, u
  * Handle simulate buys
  */
 export async function handleSimulateBuys(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
-  await bot.sendMessage(chatId, '🎲 Simulate Buys feature is coming soon...', { parse_mode: 'MarkdownV2' });
-  
-  // Return to pre-launch menu
-  await returnToPreLaunchMenu(bot, chatId);
+  try {
+    // Check if user has keypairs and LUT
+    const { userHasKeypairs } = await import('../../core/keys');
+    const { getUserKeyInfoPath } = await import('../../shared/config');
+    const fs = require('fs');
+    
+    if (!userHasKeypairs(userId)) {
+      await bot.sendMessage(chatId, '❌ You need to create keypairs first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    const keyInfoPath = getUserKeyInfoPath(userId);
+    if (!fs.existsSync(keyInfoPath)) {
+      await bot.sendMessage(chatId, '❌ No keyInfo found\\. Please create and extend LUT first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    const keyInfo = JSON.parse(fs.readFileSync(keyInfoPath, 'utf-8'));
+    if (!keyInfo.addressLUT) {
+      await bot.sendMessage(chatId, '❌ No LUT found\\. Please create and extend LUT first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(chatId, '🎲 **SIMULATE BUYS**\n\nStarting buy simulation\\.\\.\\.\n\n⚠️ **Note:** This will use sample buy amounts\\. In a full implementation, you would configure individual wallet amounts\\.', { parse_mode: 'MarkdownV2' });
+    
+    // Run simulation
+    const { buys, isValid } = await simulateUserBuys(userId);
+    
+    if (!isValid) {
+      await bot.sendMessage(
+        chatId,
+        '🚨 **SIMULATION FAILED**\n\n' +
+        'Your buy configuration violates Pump\\.fun constraints\\.\n' +
+        'The pool creation will fail with these amounts\\.\n\n' +
+        'Please reduce buy amounts and try again\\.',
+        { parse_mode: 'MarkdownV2' }
+      );
+      await returnToPreLaunchMenu(bot, chatId);
+      return;
+    }
+    
+    // Write buys to file
+    await writeBuysToUserFile(userId, buys);
+    
+    const totalSOL = buys.reduce((sum, buy) => sum + buy.solAmount, 0);
+    const totalWallets = buys.length;
+    
+    await bot.sendMessage(
+      chatId,
+      `✅ **SIMULATION SUCCESS\\!**\n\n` +
+      `📊 **Summary:**\n` +
+      `• Wallets configured: ${totalWallets}\n` +
+      `• Total SOL needed: ${totalSOL.toFixed(4)} SOL\n` +
+      `• Simulation data saved\n\n` +
+      `💡 **Next step:** Send SOL to fund wallets`,
+      { parse_mode: 'MarkdownV2' }
+    );
+    
+    await returnToPreLaunchMenu(bot, chatId);
+    
+  } catch (error: any) {
+    console.error('Error in simulation:', error);
+    const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
+    await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+  }
 }
 
 /**
  * Handle send SOL
  */
 export async function handleSendSOL(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
-  await bot.sendMessage(chatId, '💸 Send SOL feature is coming soon...', { parse_mode: 'MarkdownV2' });
-  
-  // Return to pre-launch menu
-  await returnToPreLaunchMenu(bot, chatId);
+  try {
+    // Check prerequisites
+    const { userHasKeypairs } = await import('../../core/keys');
+    const { getUserKeyInfoPath } = await import('../../shared/config');
+    const fs = require('fs');
+    
+    if (!userHasKeypairs(userId)) {
+      await bot.sendMessage(chatId, '❌ You need to create keypairs first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    const keyInfoPath = getUserKeyInfoPath(userId);
+    if (!fs.existsSync(keyInfoPath)) {
+      await bot.sendMessage(chatId, '❌ No simulation data found\\. Please run simulation first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    const keyInfo = JSON.parse(fs.readFileSync(keyInfoPath, 'utf-8'));
+    if (!keyInfo.addressLUT) {
+      await bot.sendMessage(chatId, '❌ No LUT found\\. Please create LUT first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    // Check if simulation data exists
+    const hasSimulationData = Object.keys(keyInfo).some(key => 
+      key !== 'addressLUT' && key !== 'lutCreatedAt' && key !== 'numOfWallets' && 
+      keyInfo[key].solAmount
+    );
+    
+    if (!hasSimulationData) {
+      await bot.sendMessage(chatId, '❌ No simulation data found\\. Please run simulation first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(
+      chatId,
+      '💸 **SEND SOL TO WALLETS**\n\n' +
+      'Please enter the Jito tip amount in SOL \\(e\\.g\\. 0\\.01\\):',
+      { parse_mode: 'MarkdownV2' }
+    );
+    
+    // Set user session to wait for tip input
+    const { setWaitingFor } = await import('../utils/sessions');
+    setWaitingFor(userId, 'send_sol_tip_input');
+    
+  } catch (error: any) {
+    console.error('Error in send SOL preparation:', error);
+    const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
+    await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+  }
+}
+
+/**
+ * Handle send SOL with tip
+ */
+export async function handleSendSOLWithTip(bot: TelegramBot, chatId: number, userId: number, tipText: string): Promise<void> {
+  try {
+    const tipAmount = parseFloat(tipText);
+    if (isNaN(tipAmount) || tipAmount <= 0) {
+      await bot.sendMessage(chatId, '❌ Invalid tip amount\\. Please enter a valid number \\(e\\.g\\. 0\\.01\\):', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(chatId, '⏳ Sending SOL to simulation wallets...');
+    
+    // Call the core send SOL function
+    await sendSimulationSOL(userId, tipAmount);
+    
+    const tipString = tipAmount.toString().replace(/\./g, '\\.');
+    await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n💸 SOL sent to all simulation wallets\n💰 Jito tip: ${tipString} SOL\n\n💡 **Ready for launch\\!**`, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+    
+  } catch (error: any) {
+    console.error('Error in send SOL:', error);
+    const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
+    await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+  }
 }
 
 /**
  * Handle reclaim SOL
  */
 export async function handleReclaimSOL(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
-  await bot.sendMessage(chatId, '💰 Reclaim SOL feature is coming soon...', { parse_mode: 'MarkdownV2' });
-  
-  // Return to pre-launch menu
-  await returnToPreLaunchMenu(bot, chatId);
+  try {
+    // Check if user has keypairs
+    const { userHasKeypairs } = await import('../../core/keys');
+    
+    if (!userHasKeypairs(userId)) {
+      await bot.sendMessage(chatId, '❌ You need to create keypairs first\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(
+      chatId,
+      '💰 **RECLAIM SOL**\n\n' +
+      'This will return all SOL from your wallets back to the main wallet\\.\n\n' +
+      'Please enter the Jito tip amount in SOL \\(e\\.g\\. 0\\.01\\):',
+      { parse_mode: 'MarkdownV2' }
+    );
+    
+    // Set user session to wait for tip input
+    const { setWaitingFor } = await import('../utils/sessions');
+    setWaitingFor(userId, 'reclaim_sol_tip_input');
+    
+  } catch (error: any) {
+    console.error('Error in reclaim SOL preparation:', error);
+    const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
+    await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+  }
+}
+
+/**
+ * Handle reclaim SOL with tip
+ */
+export async function handleReclaimSOLWithTip(bot: TelegramBot, chatId: number, userId: number, tipText: string): Promise<void> {
+  try {
+    const tipAmount = parseFloat(tipText);
+    if (isNaN(tipAmount) || tipAmount <= 0) {
+      await bot.sendMessage(chatId, '❌ Invalid tip amount\\. Please enter a valid number \\(e\\.g\\. 0\\.01\\):', { parse_mode: 'MarkdownV2' });
+      return;
+    }
+    
+    await bot.sendMessage(chatId, '⏳ Reclaiming SOL from all wallets...');
+    
+    // Call the core reclaim SOL function
+    await reclaimUserSOL(userId, tipAmount);
+    
+    const tipString = tipAmount.toString().replace(/\./g, '\\.');
+    await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n💰 All SOL reclaimed from wallets\n💰 Jito tip: ${tipString} SOL`, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+    
+  } catch (error: any) {
+    console.error('Error in reclaim SOL:', error);
+    const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
+    await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
+    
+    await returnToPreLaunchMenu(bot, chatId);
+  }
 }
 
 /**
