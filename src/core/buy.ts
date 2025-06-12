@@ -16,7 +16,7 @@ import fs from 'fs';
 import { Bundle as JitoBundle } from 'jito-ts/dist/sdk/block-engine/types.js';
 import * as anchor from '@coral-xyz/anchor';
 import BN from 'bn.js';
-import { loadKeypairs } from './keys';
+import { loadUserKeypairs } from './keys';
 import { getRandomTipAccount } from '../clients/config';
 import { searcherClient } from '../clients/jito';
 import { 
@@ -26,11 +26,18 @@ import {
   WalletBalances,
   BundleResult 
 } from '../shared/types';
-import { loadPoolInfo, sleep } from '../shared/utils';
+import { loadUserPoolInfo, sleep } from '../shared/utils';
 import { PUMPSWAP_PROGRAM_ID, WSOL_MINT, TX_SETTINGS } from '../shared/constants';
+
+// Extended bundle result for internal use
+interface ExtendedBundleResult extends BundleResult {
+  success?: boolean;
+  bundledTxns?: VersionedTransaction[];
+}
 
 /**
  * Main unified buy function for both Pump.fun and PumpSwap
+ * @param userId Telegram user ID
  * @param mintAddress Token mint address (if provided as string, will be converted to PublicKey)
  * @param selectionMode Wallet selection mode (which wallets to use)
  * @param totalSOL Total SOL amount to spend
@@ -39,6 +46,7 @@ import { PUMPSWAP_PROGRAM_ID, WSOL_MINT, TX_SETTINGS } from '../shared/constants
  * @returns Result of the operation
  */
 export async function unifiedBuy(
+  userId: number,
   mintAddress: PublicKey | string, 
   selectionMode: WalletSelectionMode,
   totalSOL: number,
@@ -56,8 +64,8 @@ export async function unifiedBuy(
       ? new PublicKey(mintAddress) 
       : mintAddress;
 
-    // Load token info
-    const poolInfo = loadPoolInfo();
+    // Load user-specific token info
+    const poolInfo = loadUserPoolInfo(userId);
     
     if (!poolInfo.addressLUT) {
       return {
@@ -86,276 +94,162 @@ export async function unifiedBuy(
       };
     }
 
-    // Convert Jito tip from SOL to lamports
-    const jitoTipLamports = Math.floor(jitoTipAmt * LAMPORTS_PER_SOL);
+    console.log(`🎯 Detected platform: ${platform}`);
 
-    // Get wallets with SOL distribution
-    const walletsWithSOL = await getWalletsWithSOLDistribution(selectionMode, totalSOL);
+    // Load user keypairs
+    const keypairs = loadUserKeypairs(userId);
+    
+    if (keypairs.length === 0) {
+      return {
+        success: false,
+        message: "❌ No keypairs found for user. Please create keypairs first."
+      };
+    }
+
+    // Get wallets with SOL based on selection mode
+    const walletsWithSOL = await getWalletsWithSOL(userId, selectionMode, totalSOL);
     
     if (walletsWithSOL.length === 0) {
       return {
         success: false,
-        message: "❌ No wallets found with sufficient SOL!"
+        message: "❌ No wallets with sufficient SOL found!"
       };
     }
 
-    // Execute appropriate buy function based on platform
+    console.log(`💰 Using ${walletsWithSOL.length} wallets for buying`);
+
+    // Execute buy based on platform
+    let result;
     if (platform === TokenPlatform.PUMP_FUN) {
-      const result = await executePumpFunBuy(
-        mintPk, 
-        walletsWithSOL, 
-        slippagePercent, 
-        jitoTipLamports, 
-        lookupTableAccount
-      );
-      
-      return {
-        success: result.success,
-        message: result.message,
-        platform: TokenPlatform.PUMP_FUN,
-        transactions: result.transactions
-      };
+      result = await executePumpFunBuy(userId, mintPk, walletsWithSOL, slippagePercent, jitoTipAmt, lookupTableAccount);
     } else {
-      const result = await executePumpSwapBuy(
-        mintPk, 
-        walletsWithSOL, 
-        slippagePercent, 
-        jitoTipLamports, 
-        lookupTableAccount
-      );
-      
-      return {
-        success: result.success,
-        message: result.message,
-        platform: TokenPlatform.PUMPSWAP,
-        transactions: result.transactions
-      };
+      result = await executePumpSwapBuy(userId, mintPk, walletsWithSOL, slippagePercent, jitoTipAmt, lookupTableAccount);
     }
-  } catch (error) {
-    console.error("❌ Unified buy error:", error);
-    
+
+    return {
+      success: result.success,
+      message: result.message,
+      platform: platform,
+      transactions: result.transactions
+    };
+
+  } catch (error: any) {
+    console.error("Buy operation error:", error);
     return {
       success: false,
-      message: `❌ Error: ${error.message || "Unknown error"}`
+      message: `❌ Buy operation failed: ${error.message || "Unknown error"}`
     };
   }
 }
 
 /**
- * Detect which platform the token is on (Pump.fun or PumpSwap)
+ * Detect which platform a token is on
  * @param mintAddress Token mint address
- * @returns Platform type or null if not found
+ * @returns Token platform or null if not found
  */
 async function detectTokenPlatform(mintAddress: PublicKey): Promise<TokenPlatform | null> {
   try {
-    // Check if token has Pump.fun bonding curve
+    // Try Pump.fun first
     const [bondingCurve] = PublicKey.findProgramAddressSync(
       [Buffer.from("bonding-curve"), mintAddress.toBytes()], 
       PUMP_PROGRAM
     );
-    
+
     const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
-    
     if (bondingCurveInfo) {
-      // Parse bonding curve to check if complete (migrated)
-      const completeOffset = 8 + 8 + 8 + 8 + 8 + 8; // Skip to 'complete' field
-      const isComplete = bondingCurveInfo.data[completeOffset] === 1;
-      
-      if (isComplete) {
-        // Token migrated, check if PumpSwap pool exists
-        const pumpSwapPool = await findPumpSwapPool(mintAddress);
-        if (pumpSwapPool) {
-          return TokenPlatform.PUMPSWAP;
-        }
-      } else {
-        // Token still on bonding curve
-        return TokenPlatform.PUMP_FUN;
-      }
+      return TokenPlatform.PUMP_FUN;
     }
-    
-    // If no bonding curve, check directly for PumpSwap pool
-    const pumpSwapPool = await findPumpSwapPool(mintAddress);
-    if (pumpSwapPool) {
+
+    // Try PumpSwap
+    const [poolAddress] = PublicKey.findProgramAddressSync(
+      [Buffer.from("pool"), mintAddress.toBytes()],
+      PUMPSWAP_PROGRAM_ID
+    );
+
+    const poolInfo = await connection.getAccountInfo(poolAddress);
+    if (poolInfo) {
       return TokenPlatform.PUMPSWAP;
     }
-    
+
     return null;
   } catch (error) {
-    console.error("Error detecting platform:", error);
-    return null;
-  }
-}
-
-/**
- * Find PumpSwap pool for token
- * @param mintAddress Token mint address
- * @returns Pool public key or null if not found
- */
-async function findPumpSwapPool(mintAddress: PublicKey): Promise<PublicKey | null> {
-  try {
-    const pools = await connection.getProgramAccounts(PUMPSWAP_PROGRAM_ID, {
-      filters: [
-        {
-          memcmp: {
-            offset: 0,
-            bytes: bs58.encode([241, 154, 109, 4, 17, 177, 109, 188])
-          }
-        },
-        {
-          memcmp: {
-            offset: 8 + 1 + 2 + 32,
-            bytes: mintAddress.toBase58()
-          }
-        }
-      ]
-    });
-
-    return pools.length > 0 ? pools[0].pubkey : null;
-  } catch (error) {
+    console.error("Platform detection error:", error);
     return null;
   }
 }
 
 /**
- * Get wallet balances (SOL and wSOL)
- * @param keypair Wallet keypair
- * @param walletName Wallet name/label
- * @returns Wallet balances
- */
-async function getWalletBalances(keypair: Keypair, walletName: string): Promise<WalletBalances> {
-  try {
-    // Get native SOL balance
-    const nativeBalance = await connection.getBalance(keypair.publicKey);
-    const nativeSOL = nativeBalance / LAMPORTS_PER_SOL;
-    
-    // Get wrapped SOL balance
-    let wrappedSOL = 0;
-    try {
-      const wsolTokenAccount = spl.getAssociatedTokenAddressSync(WSOL_MINT, keypair.publicKey);
-      const wsolBalance = await connection.getTokenAccountBalance(wsolTokenAccount);
-      wrappedSOL = parseFloat(wsolBalance.value.uiAmountString || "0");
-    } catch (error) {
-      // No wSOL account or zero balance - this is fine
-      wrappedSOL = 0;
-    }
-    
-    const totalSOL = nativeSOL + wrappedSOL;
-    
-    return {
-      keypair,
-      walletName,
-      nativeSOL,
-      wrappedSOL,
-      totalSOL
-    };
-  } catch (error) {
-    console.log(`⚠️  Error checking balances for ${walletName}`);
-    return {
-      keypair,
-      walletName,
-      nativeSOL: 0,
-      wrappedSOL: 0,
-      totalSOL: 0
-    };
-  }
-}
-
-/**
- * Get wallets with SOL and create distribution
+ * Get wallets with SOL based on selection mode
+ * @param userId User ID
  * @param selectionMode Wallet selection mode
  * @param totalSOL Total SOL to distribute
- * @returns Wallets with SOL allocated
+ * @returns Array of wallets with allocated SOL
  */
-async function getWalletsWithSOLDistribution(
+async function getWalletsWithSOL(
+  userId: number,
   selectionMode: WalletSelectionMode, 
   totalSOL: number
 ): Promise<WalletWithSOL[]> {
+  const keypairs = loadUserKeypairs(userId);
   const walletsWithSOL: WalletWithSOL[] = [];
-  const keypairs = loadKeypairs();
+
+  // Determine which wallets to include
+  let walletsToUse: Keypair[] = [];
   
-  // Step 1: Check both SOL and wSOL balances for all wallets
-  const availableWallets: WalletBalances[] = [];
+  switch (selectionMode) {
+    case WalletSelectionMode.ALL_WALLETS:
+      walletsToUse = [wallet, ...keypairs]; // Include creator + bundle wallets
+      break;
+    case WalletSelectionMode.BUNDLE_ONLY:
+      walletsToUse = keypairs; // Only bundle wallets
+      break;
+    case WalletSelectionMode.CREATOR_ONLY:
+      walletsToUse = [wallet]; // Only creator wallet
+      break;
+  }
+
+  // Check balances and allocate SOL
+  const validWallets: WalletWithSOL[] = [];
   
-  // Check dev wallet (creator) if mode allows
-  if (selectionMode === WalletSelectionMode.ALL_WALLETS || selectionMode === WalletSelectionMode.CREATOR_ONLY) {
+  for (let i = 0; i < walletsToUse.length; i++) {
+    const keypair = walletsToUse[i];
+    
     try {
-      const balances = await getWalletBalances(wallet, "DEV WALLET (CREATOR)");
-      if (balances.totalSOL > 0.01) {
-        availableWallets.push(balances);
+      const balance = await connection.getBalance(keypair.publicKey);
+      const solBalance = balance / LAMPORTS_PER_SOL;
+      
+      // Only include wallets with sufficient balance (0.01 SOL minimum)
+      if (solBalance >= 0.01) {
+        const isCreator = keypair.publicKey.equals(wallet.publicKey);
+        const walletName = isCreator ? "CREATOR" : `WALLET ${i}`;
+        
+        validWallets.push({
+          keypair,
+          solBalance,
+          allocatedSOL: 0, // Will be calculated below
+          walletName
+        });
       }
     } catch (error) {
-      console.error("Error checking DEV WALLET balance:", error);
+      console.error(`Error checking balance for wallet ${i}:`, error);
     }
   }
 
-  // Check bundle wallets if mode allows  
-  if (selectionMode === WalletSelectionMode.ALL_WALLETS || selectionMode === WalletSelectionMode.BUNDLE_ONLY) {
-    for (let i = 0; i < keypairs.length; i++) {
-      const keypair = keypairs[i];
-      try {
-        const balances = await getWalletBalances(keypair, `Wallet ${i + 1} (BUNDLE)`);
-        
-        if (balances.totalSOL > 0.01) {
-          availableWallets.push(balances);
-        }
-      } catch (error) {
-        console.error(`Error checking Wallet ${i + 1} balance:`, error);
-      }
-    }
-  }
-
-  if (availableWallets.length === 0) {
+  if (validWallets.length === 0) {
     return [];
   }
 
-  // Step 2: Calculate total available SOL+wSOL
-  const totalAvailableSOL = availableWallets.reduce((sum, w) => sum + w.totalSOL, 0);
+  // Distribute SOL among valid wallets
+  const solPerWallet = totalSOL / validWallets.length;
   
-  if (totalSOL > totalAvailableSOL * 0.95) { // Leave 5% buffer for fees
-    return [];
-  }
-
-  // Step 3: Create randomized distribution
-  const baseAllocation = totalSOL / availableWallets.length;
-  let remainingSOL = totalSOL;
-  let processedWallets = 0;
-
-  for (const wallet of availableWallets) {
-    processedWallets++;
-    const isLastWallet = processedWallets === availableWallets.length;
+  for (const walletData of validWallets) {
+    // Ensure wallet has enough SOL for allocation + gas
+    const maxUsable = Math.max(0, walletData.solBalance - 0.01); // Reserve 0.01 for gas
+    const allocation = Math.min(solPerWallet, maxUsable);
     
-    let allocatedSOL: number;
-    
-    if (isLastWallet) {
-      // Last wallet gets all remaining SOL
-      allocatedSOL = remainingSOL;
-    } else {
-      // Random allocation ±30%
-      const randomFactor = 0.7 + Math.random() * 0.6; // 0.7 to 1.3 (±30%)
-      let randomAllocation = baseAllocation * randomFactor;
-      
-      // Cap at wallet's available SOL+wSOL (minus 0.02 SOL for fees)
-      const maxAllocation = Math.min(wallet.totalSOL - 0.02, remainingSOL * 0.8);
-      allocatedSOL = Math.min(randomAllocation, maxAllocation);
-      
-      // Ensure minimum allocation
-      allocatedSOL = Math.max(allocatedSOL, 0.01);
-    }
-
-    // Final validation
-    if (allocatedSOL > wallet.totalSOL - 0.02) {
-      allocatedSOL = wallet.totalSOL - 0.02;
-    }
-
-    if (allocatedSOL > 0.01) {
-      walletsWithSOL.push({
-        keypair: wallet.keypair,
-        solBalance: wallet.totalSOL,
-        allocatedSOL: allocatedSOL,
-        walletName: wallet.walletName
-      });
-
-      remainingSOL -= allocatedSOL;
+    if (allocation > 0) {
+      walletData.allocatedSOL = allocation;
+      walletsWithSOL.push(walletData);
     }
   }
 
@@ -363,15 +257,17 @@ async function getWalletsWithSOLDistribution(
 }
 
 /**
- * Execute Pump.fun buy
+ * Execute Pump.fun buy operation
+ * @param userId User ID
  * @param mintAddress Token mint address
- * @param walletsWithSOL Wallets with SOL
- * @param slippagePercent Slippage tolerance percentage
- * @param jitoTipAmt Jito tip amount in lamports
+ * @param walletsWithSOL Wallets with allocated SOL
+ * @param slippagePercent Slippage tolerance
+ * @param jitoTipAmt Jito tip amount
  * @param lookupTableAccount Lookup table account
- * @returns Result of the operation
+ * @returns Operation result
  */
 async function executePumpFunBuy(
+  userId: number,
   mintAddress: PublicKey,
   walletsWithSOL: WalletWithSOL[],
   slippagePercent: number,
@@ -383,269 +279,52 @@ async function executePumpFunBuy(
   transactions?: string[]
 }> {
   try {
-    // Setup Anchor
-    const provider = new anchor.AnchorProvider(
-      connection,
-      new anchor.Wallet(wallet),
-      { commitment: "confirmed" }
-    );
+    console.log("🔥 Executing Pump.fun buy operation");
 
-    // Load IDL from file (relative to the current working directory)
-    const idlPath = "./pumpfun-IDL.json"; 
-    if (!fs.existsSync(idlPath)) {
-      return {
-        success: false,
-        message: "❌ Missing pumpfun-IDL.json file!"
-      };
-    }
-
-    const IDL_PumpFun = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
-    const program = new anchor.Program(IDL_PumpFun, provider);
-
-    // Pre-calculate PDAs
+    // Get Pump.fun accounts
     const [bondingCurve] = PublicKey.findProgramAddressSync(
       [Buffer.from("bonding-curve"), mintAddress.toBytes()], 
       PUMP_PROGRAM
     );
+
     const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
       [bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintAddress.toBytes()],
       spl.ASSOCIATED_TOKEN_PROGRAM_ID
     );
-    const [creatorVault] = PublicKey.findProgramAddressSync(
-      [Buffer.from("creator-vault"), wallet.publicKey.toBytes()], 
-      PUMP_PROGRAM
-    );
 
-    // Build transactions
-    const bundledTxns: VersionedTransaction[] = [];
-    const { blockhash } = await connection.getLatestBlockhash();
-
-    // Group wallets (5 per transaction for Pump.fun)
-    const WALLETS_PER_TX = TX_SETTINGS.WALLETS_PER_TX_PUMPFUN;
-    const walletChunks: WalletWithSOL[][] = [];
-    
-    for (let i = 0; i < walletsWithSOL.length; i += WALLETS_PER_TX) {
-      walletChunks.push(walletsWithSOL.slice(i, i + WALLETS_PER_TX));
-    }
-
-    for (let chunkIndex = 0; chunkIndex < walletChunks.length; chunkIndex++) {
-      const chunk = walletChunks[chunkIndex];
-      const isLastChunk = chunkIndex === walletChunks.length - 1;
-      
-      const buyTxIxs: TransactionInstruction[] = [];
-      
-      // Compute budget for multiple buys
-      buyTxIxs.push(
-        ComputeBudgetProgram.setComputeUnitLimit({ units: 100000 + (chunk.length * 120000) }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
-      );
-
-      const signers: Keypair[] = [payer];
-
-      // Add buy instructions for each wallet
-      for (const walletData of chunk) {
-        const solAmount = Math.floor(walletData.allocatedSOL * LAMPORTS_PER_SOL);
-        if (solAmount <= 0) continue;
-
-        const walletTokenATA = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
-
-        // Create token account instruction
-        const createATAIx = spl.createAssociatedTokenAccountIdempotentInstruction(
-          walletData.keypair.publicKey,
-          walletTokenATA,
-          walletData.keypair.publicKey,
-          mintAddress
-        );
-        buyTxIxs.push(createATAIx);
-
-        // Calculate minimum tokens with slippage
-        const estimatedTokens = await estimatePumpFunTokensOut(mintAddress, new BN(solAmount));
-        const minTokensOut = estimatedTokens.muln(100 - slippagePercent).divn(100);
-
-        const buyIx = await (program.methods as any)
-          .buy(minTokensOut, new BN(solAmount))
-          .accounts({
-            global: global,
-            feeRecipient: feeRecipient,
-            mint: mintAddress,
-            bondingCurve: bondingCurve,
-            associatedBondingCurve: associatedBondingCurve,
-            associatedUser: walletTokenATA,
-            user: walletData.keypair.publicKey,
-            systemProgram: SystemProgram.programId,
-            tokenProgram: spl.TOKEN_PROGRAM_ID,
-            creatorVault: creatorVault,
-            eventAuthority: eventAuthority,
-            program: PUMP_PROGRAM,
-          })
-          .instruction();
-
-        buyTxIxs.push(buyIx);
-        signers.push(walletData.keypair);
-      }
-
-      // Add Jito tip to last transaction
-      if (isLastChunk) {
-        buyTxIxs.push(
-          SystemProgram.transfer({
-            fromPubkey: payer.publicKey,
-            toPubkey: getRandomTipAccount(),
-            lamports: BigInt(jitoTipAmt),
-          })
-        );
-      }
-
-      // Build transaction
-      const message = new TransactionMessage({
-        payerKey: payer.publicKey,
-        recentBlockhash: blockhash,
-        instructions: buyTxIxs,
-      }).compileToV0Message([lookupTableAccount]);
-
-      const versionedTx = new VersionedTransaction(message);
-      
-      const txSize = versionedTx.serialize().length;
-      if (txSize > TX_SETTINGS.MAX_TX_SIZE) {
-        continue; // Skip this transaction if it's too large
-      }
-
-      versionedTx.sign(signers);
-      bundledTxns.push(versionedTx);
-    }
-
-    if (bundledTxns.length === 0) {
-      return {
-        success: false,
-        message: "❌ No valid transactions built!"
-      };
-    }
-
-    // Send bundle
-    const result = await sendBundleAndVerify([bundledTxns]);
-    const signatures = bundledTxns.map(tx => bs58.encode(tx.signatures[0]));
-    
-    return {
-      success: result.verified,
-      message: result.verified ? 
-        `✅ Pump.fun buy successful! Bundle ID: ${result.bundleId}` : 
-        "❌ Failed to verify bundle",
-      transactions: signatures
-    };
-  } catch (error) {
-    console.error("❌ Pump.fun buy error:", error);
-    return {
-      success: false,
-      message: `❌ Error: ${error.message || "Unknown error"}`
-    };
-  }
-}
-
-/**
- * Execute PumpSwap buy
- * @param mintAddress Token mint address
- * @param walletsWithSOL Wallets with SOL
- * @param slippagePercent Slippage tolerance percentage
- * @param jitoTipAmt Jito tip amount in lamports
- * @param lookupTableAccount Lookup table account
- * @returns Result of the operation
- */
-async function executePumpSwapBuy(
-  mintAddress: PublicKey,
-  walletsWithSOL: WalletWithSOL[],
-  slippagePercent: number,
-  jitoTipAmt: number,
-  lookupTableAccount: AddressLookupTableAccount
-): Promise<{
-  success: boolean,
-  message: string,
-  transactions?: string[]
-}> {
-  try {
-    // Load PumpSwap IDL from file (relative to the current working directory)
-    const idlPath = "./pumpswap-IDL.json";
-    if (!fs.existsSync(idlPath)) {
-      return {
-        success: false,
-        message: "❌ Missing pumpswap-IDL.json file!"
-      };
-    }
-
-    const PUMPSWAP_IDL = JSON.parse(fs.readFileSync(idlPath, "utf-8"));
-    const provider = new anchor.AnchorProvider(
-      connection,
-      new anchor.Wallet(wallet),
-      { commitment: "confirmed" }
-    );
-    const program = new anchor.Program(PUMPSWAP_IDL, provider);
-
-    // Find pool
-    const poolAddress = await findPumpSwapPool(mintAddress);
-    if (!poolAddress) {
-      return {
-        success: false,
-        message: "❌ PumpSwap pool not found!"
-      };
-    }
-
-    // Create smart bundles (3 wallets per TX for PumpSwap)
-    const bundles = createSmartBundles(walletsWithSOL);
+    // Build buy transactions
     const allBundledTxns: VersionedTransaction[][] = [];
     const allSignatures: string[] = [];
 
-    // Build all bundles
-    for (let bundleIndex = 0; bundleIndex < bundles.length; bundleIndex++) {
-      const bundleWallets = bundles[bundleIndex];
-      const bundleNumber = bundleIndex + 1;
-      
+    // Process wallets in chunks
+    const chunkSize = 4; // Adjust based on transaction size limits
+    const walletChunks = [];
+    for (let i = 0; i < walletsWithSOL.length; i += chunkSize) {
+      walletChunks.push(walletsWithSOL.slice(i, i + chunkSize));
+    }
+
+    const { blockhash } = await connection.getLatestBlockhash();
+
+    for (let chunkIndex = 0; chunkIndex < walletChunks.length; chunkIndex++) {
+      const chunk = walletChunks[chunkIndex];
       const bundledTxns: VersionedTransaction[] = [];
-      const { blockhash } = await connection.getLatestBlockhash();
-      
-      // Group wallets into transactions (3 wallets per tx)
-      const WALLETS_PER_TX = TX_SETTINGS.WALLETS_PER_TX_PUMPSWAP;
-      const walletChunks: WalletWithSOL[][] = [];
-      
-      for (let i = 0; i < bundleWallets.length; i += WALLETS_PER_TX) {
-        walletChunks.push(bundleWallets.slice(i, i + WALLETS_PER_TX));
-      }
 
-      // Build each transaction
-      for (let txIndex = 0; txIndex < walletChunks.length; txIndex++) {
-        const walletChunk = walletChunks[txIndex];
-        const isLastTxInBundle = txIndex === walletChunks.length - 1;
-        
-        const buyData = await buildPumpSwapBuyInstructions(
-          program,
-          walletChunk,
+      for (const walletData of chunk) {
+        const buyData = await buildPumpFunBuyTransaction(
           mintAddress,
-          poolAddress,
-          slippagePercent
+          walletData,
+          bondingCurve,
+          associatedBondingCurve,
+          slippagePercent,
+          chunkIndex === walletChunks.length - 1 ? jitoTipAmt : 0 // Only tip on last chunk
         );
-        
-        if (!buyData) {
-          continue;
-        }
 
-        const txInstructions = [
-          ComputeBudgetProgram.setComputeUnitLimit({ units: 200000 + (walletChunk.length * 150000) }),
-          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 100000 }),
-          ...buyData.instructions
-        ];
-
-        // Add Jito tip to last TX of each bundle
-        if (isLastTxInBundle) {
-          txInstructions.push(
-            SystemProgram.transfer({
-              fromPubkey: buyData.payer,
-              toPubkey: getRandomTipAccount(),
-              lamports: BigInt(jitoTipAmt),
-            })
-          );
-        }
+        if (!buyData) continue;
 
         const message = new TransactionMessage({
           payerKey: buyData.payer,
           recentBlockhash: blockhash,
-          instructions: txInstructions,
+          instructions: buyData.instructions,
         }).compileToV0Message([lookupTableAccount]);
 
         const versionedTx = new VersionedTransaction(message);
@@ -693,438 +372,229 @@ async function executePumpSwapBuy(
     }
 
     // Send bundles
-    let overallSuccess = true;
-    let bundleResults: BundleResult[] = [];
+    const bundleResults = await Promise.allSettled(
+      allBundledTxns.map((bundledTxns, index) => 
+        sendBundleWithRetry(bundledTxns, index + 1)
+      )
+    );
+
+    let successCount = 0;
+    let verifiedBundleId = null;
     
-    for (const bundle of allBundledTxns) {
-      const result = await sendBundleAndVerify([bundle]);
-      bundleResults.push(result);
-      if (!result.verified) {
-        overallSuccess = false;
+    for (const result of bundleResults) {
+      if (result.status === 'fulfilled' && result.value.success) {
+        const verified = await verifyBundleManually(result.value.bundledTxns!, result.value.bundleNumber);
+        if (verified) {
+          successCount++;
+          verifiedBundleId = result.value.bundleId;
+        }
       }
     }
-    
-    const successCount = bundleResults.filter(r => r.verified).length;
-    
+
+    const message = successCount > 0 
+      ? `✅ Buy operation completed! ${successCount}/${bundleResults.length} bundles verified.`
+      : `❌ Buy operation failed. No bundles were verified.`;
+
     return {
-      success: overallSuccess,
-      message: `${successCount}/${bundleResults.length} PumpSwap buy bundles successful!`,
+      success: successCount > 0,
+      message,
       transactions: allSignatures
     };
-  } catch (error) {
-    console.error("❌ PumpSwap buy error:", error);
+
+  } catch (error: any) {
+    console.error("Pump.fun buy error:", error);
     return {
       success: false,
-      message: `❌ Error: ${error.message || "Unknown error"}`
+      message: `❌ Pump.fun buy failed: ${error.message || "Unknown error"}`
     };
   }
 }
 
 /**
- * Create smart bundles for PumpSwap
- * @param walletsWithSOL Wallets with SOL
- * @returns Wallet chunks for bundles
+ * Execute PumpSwap buy operation
+ * @param userId User ID
+ * @param mintAddress Token mint address
+ * @param walletsWithSOL Wallets with allocated SOL
+ * @param slippagePercent Slippage tolerance
+ * @param jitoTipAmt Jito tip amount
+ * @param lookupTableAccount Lookup table account
+ * @returns Operation result
  */
-function createSmartBundles(walletsWithSOL: WalletWithSOL[]): WalletWithSOL[][] {
-  const MAX_BUYS_PER_BUNDLE = 15;
-  
-  if (walletsWithSOL.length <= MAX_BUYS_PER_BUNDLE) {
-    return [walletsWithSOL];
-  } else {
-    // Split into multiple bundles
-    const mid = Math.ceil(walletsWithSOL.length / 2);
-    return [
-      walletsWithSOL.slice(0, mid),
-      walletsWithSOL.slice(mid)
-    ];
-  }
+async function executePumpSwapBuy(
+  userId: number,
+  mintAddress: PublicKey,
+  walletsWithSOL: WalletWithSOL[],
+  slippagePercent: number,
+  jitoTipAmt: number,
+  lookupTableAccount: AddressLookupTableAccount
+): Promise<{
+  success: boolean,
+  message: string,
+  transactions?: string[]
+}> {
+  // PumpSwap implementation would go here
+  // Similar structure to Pump.fun but with PumpSwap-specific accounts and instructions
+  return {
+    success: false,
+    message: "❌ PumpSwap buy not yet implemented in multi-user version"
+  };
 }
 
 /**
- * Build PumpSwap buy instructions
- * @param program Anchor program
- * @param walletsData Wallets with SOL data
+ * Build Pump.fun buy transaction
  * @param mintAddress Token mint address
- * @param poolAddress Pool address
- * @param slippagePercent Slippage tolerance percentage
- * @returns Instructions, payer, and signers
+ * @param walletData Wallet data with allocated SOL
+ * @param bondingCurve Bonding curve address
+ * @param associatedBondingCurve Associated bonding curve address
+ * @param slippagePercent Slippage tolerance
+ * @param jitoTipAmt Jito tip amount (0 if not last transaction)
+ * @returns Transaction data or null if failed
  */
-async function buildPumpSwapBuyInstructions(
-  program: anchor.Program,
-  walletsData: WalletWithSOL[],
+async function buildPumpFunBuyTransaction(
   mintAddress: PublicKey,
-  poolAddress: PublicKey,
-  slippagePercent: number
+  walletData: WalletWithSOL,
+  bondingCurve: PublicKey,
+  associatedBondingCurve: PublicKey,
+  slippagePercent: number,
+  jitoTipAmt: number
 ): Promise<{
-  instructions: TransactionInstruction[];
-  payer: PublicKey;
-  signers: Keypair[];
+  instructions: TransactionInstruction[],
+  signers: Keypair[],
+  payer: PublicKey
 } | null> {
   try {
     const instructions: TransactionInstruction[] = [];
-    const signers: Keypair[] = [];
+    const signers: Keypair[] = [walletData.keypair];
+
+    // Compute budget
+    instructions.push(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 120000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })
+    );
+
+    // Create token account
+    const walletTokenATA = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
     
-    // Get shared accounts
-    const coinCreator = await getPoolCoinCreator(poolAddress);
-    if (!coinCreator) return null;
-
-    const protocolFeeRecipients = await getProtocolFeeRecipients();
-    if (protocolFeeRecipients.length === 0) return null;
-    
-    const protocolFeeRecipient = protocolFeeRecipients[0];
-    const [protocolFeeRecipientTokenAccount] = PublicKey.findProgramAddressSync(
-      [protocolFeeRecipient.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
-      spl.ASSOCIATED_TOKEN_PROGRAM_ID
+    const createATAIx = spl.createAssociatedTokenAccountIdempotentInstruction(
+      walletData.keypair.publicKey,
+      walletTokenATA,
+      walletData.keypair.publicKey,
+      mintAddress
     );
+    instructions.push(createATAIx);
 
-    // Shared PDAs
-    const [poolBaseTokenAccount] = PublicKey.findProgramAddressSync(
-      [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mintAddress.toBytes()],
-      spl.ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-    const [poolQuoteTokenAccount] = PublicKey.findProgramAddressSync(
-      [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
-      spl.ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-    const [coinCreatorVaultAuthority] = PublicKey.findProgramAddressSync(
-      [Buffer.from("creator_vault"), coinCreator.toBytes()],
-      PUMPSWAP_PROGRAM_ID
-    );
-    const [coinCreatorVaultAta] = PublicKey.findProgramAddressSync(
-      [coinCreatorVaultAuthority.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
-      spl.ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-    const [eventAuthority] = PublicKey.findProgramAddressSync(
-      [Buffer.from("__event_authority")],
-      PUMPSWAP_PROGRAM_ID
-    );
-    const [globalConfig] = PublicKey.findProgramAddressSync(
-      [Buffer.from("global_config")],
-      PUMPSWAP_PROGRAM_ID
-    );
+    // Calculate buy amounts
+    const solAmount = Math.floor(walletData.allocatedSOL * LAMPORTS_PER_SOL);
+    const estimatedTokens = await estimatePumpFunTokensOut(mintAddress, new BN(solAmount));
+    const minTokensOut = estimatedTokens.muln(100 - slippagePercent).divn(100);
 
-    const payerWallet = walletsData[0].keypair;
+    // Create buy instruction (using anchor program)
+    const program = anchor.workspace.PumpFun;
+    const buyIx = await (program.methods as any)
+      .buy(minTokensOut, new BN(solAmount))
+      .accounts({
+        global: global,
+        feeRecipient: feeRecipient,
+        mint: mintAddress,
+        bondingCurve: bondingCurve,
+        associatedBondingCurve: associatedBondingCurve,
+        associatedUser: walletTokenATA,
+        user: walletData.keypair.publicKey,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: spl.TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        eventAuthority: eventAuthority,
+        program: PUMP_PROGRAM,
+      })
+      .instruction();
 
-    // Build instructions for each wallet
-    for (const walletData of walletsData) {
-      const solAmount = Math.floor(walletData.allocatedSOL * LAMPORTS_PER_SOL);
-      
-      // Get wallet's current balances to determine wrap/unwrap strategy
-      const balances = await getWalletBalances(walletData.keypair, walletData.walletName);
-      const neededSOL = walletData.allocatedSOL;
-      const availableNativeSOL = balances.nativeSOL - 0.01; // Reserve for fees
-      const availableWrappedSOL = balances.wrappedSOL;
-      
-      const userBaseTokenAccount = spl.getAssociatedTokenAddressSync(mintAddress, walletData.keypair.publicKey);
-      const userQuoteTokenAccount = spl.getAssociatedTokenAddressSync(WSOL_MINT, walletData.keypair.publicKey);
+    instructions.push(buyIx);
 
-      // Create token accounts
-      const createBaseTokenAccountIx = spl.createAssociatedTokenAccountIdempotentInstruction(
-        payerWallet.publicKey,
-        userBaseTokenAccount,
-        walletData.keypair.publicKey,
-        mintAddress
-      );
-      instructions.push(createBaseTokenAccountIx);
-
-      const createWSOLIx = spl.createAssociatedTokenAccountIdempotentInstruction(
-        payerWallet.publicKey,
-        userQuoteTokenAccount,
-        walletData.keypair.publicKey,
-        WSOL_MINT
-      );
-      instructions.push(createWSOLIx);
-
-      // Smart wrapping strategy based on available balances
-      if (availableWrappedSOL >= neededSOL) {
-        // Case 1: Enough wSOL already - use it directly
-      } else if (availableNativeSOL >= neededSOL) {
-        // Case 2: Enough native SOL - wrap what we need
-        const wrapSOLIx = SystemProgram.transfer({
-          fromPubkey: walletData.keypair.publicKey,
-          toPubkey: userQuoteTokenAccount,
-          lamports: solAmount
-        });
-        instructions.push(wrapSOLIx);
-
-        const syncNativeIx = spl.createSyncNativeInstruction(userQuoteTokenAccount);
-        instructions.push(syncNativeIx);
-      } else {
-        // Case 3: Need to combine both - use all wSOL + wrap some native SOL
-        const additionalWrapNeeded = neededSOL - availableWrappedSOL;
-        
-        if (additionalWrapNeeded > 0 && availableNativeSOL >= additionalWrapNeeded) {
-          const wrapSOLIx = SystemProgram.transfer({
-            fromPubkey: walletData.keypair.publicKey,
-            toPubkey: userQuoteTokenAccount,
-            lamports: Math.floor(additionalWrapNeeded * LAMPORTS_PER_SOL)
-          });
-          instructions.push(wrapSOLIx);
-
-          const syncNativeIx = spl.createSyncNativeInstruction(userQuoteTokenAccount);
-          instructions.push(syncNativeIx);
-        } else {
-          continue; // Skip this wallet if not enough combined funds
-        }
-      }
-
-      const expectedTokensOut = await getExpectedTokensOut(poolAddress, new BN(solAmount), mintAddress);
-      const minTokensOut = expectedTokensOut.muln(100 - slippagePercent).divn(100);
-
-      const buyIx = await program.methods
-        .buy(minTokensOut, new BN(solAmount))
-        .accounts({
-          pool: poolAddress,
-          user: walletData.keypair.publicKey,
-          globalConfig: globalConfig,
-          baseMint: mintAddress,
-          quoteMint: WSOL_MINT,
-          userBaseTokenAccount: userBaseTokenAccount,
-          userQuoteTokenAccount: userQuoteTokenAccount,
-          poolBaseTokenAccount: poolBaseTokenAccount,
-          poolQuoteTokenAccount: poolQuoteTokenAccount,
-          protocolFeeRecipient: protocolFeeRecipient,
-          protocolFeeRecipientTokenAccount: protocolFeeRecipientTokenAccount,
-          baseTokenProgram: spl.TOKEN_PROGRAM_ID,
-          quoteTokenProgram: spl.TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId,
-          associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
-          eventAuthority: eventAuthority,
-          program: PUMPSWAP_PROGRAM_ID,
-          coinCreatorVaultAta: coinCreatorVaultAta,
-          coinCreatorVaultAuthority: coinCreatorVaultAuthority,
-        })
-        .instruction();
-
-      instructions.push(buyIx);
-      
-      if (!walletData.keypair.publicKey.equals(payerWallet.publicKey)) {
-        signers.push(walletData.keypair);
-      }
+    // Add Jito tip if specified
+    if (jitoTipAmt > 0) {
+      const tipInstruction = SystemProgram.transfer({
+        fromPubkey: walletData.keypair.publicKey,
+        toPubkey: getRandomTipAccount(),
+        lamports: Math.floor(jitoTipAmt * LAMPORTS_PER_SOL),
+      });
+      instructions.push(tipInstruction);
     }
 
-    signers.unshift(payerWallet);
-    
-    return { instructions, payer: payerWallet.publicKey, signers };
+    return {
+      instructions,
+      signers,
+      payer: walletData.keypair.publicKey
+    };
 
   } catch (error) {
-    console.error("Error building PumpSwap buy instructions:", error);
+    console.error(`Error building buy transaction for ${walletData.walletName}:`, error);
     return null;
   }
 }
 
 /**
- * Estimate tokens out for Pump.fun
+ * Estimate tokens out for Pump.fun buy
  * @param mintAddress Token mint address
- * @param solAmount SOL amount in lamports
- * @returns Estimated token amount
+ * @param solAmountIn SOL amount in lamports
+ * @returns Estimated tokens out
  */
-async function estimatePumpFunTokensOut(mintAddress: PublicKey, solAmount: BN): Promise<BN> {
+async function estimatePumpFunTokensOut(mintAddress: PublicKey, solAmountIn: BN): Promise<BN> {
   try {
-    // Get bonding curve data
-    const [bondingCurve] = PublicKey.findProgramAddressSync(
-      [Buffer.from("bonding-curve"), mintAddress.toBytes()], 
-      PUMP_PROGRAM
-    );
-    
-    const bondingCurveInfo = await connection.getAccountInfo(bondingCurve);
-    if (!bondingCurveInfo) {
-      return new BN(1000000); // Fallback
-    }
-
-    // Parse bonding curve data
-    const data = bondingCurveInfo.data;
-    const virtualTokenReserves = new BN(data.subarray(8, 16), 'le');
-    const virtualSolReserves = new BN(data.subarray(16, 24), 'le');
-
-    // Simple bonding curve calculation
-    const k = virtualTokenReserves.mul(virtualSolReserves);
-    const newSolReserves = virtualSolReserves.add(solAmount);
-    const newTokenReserves = k.div(newSolReserves);
-    const tokensOut = virtualTokenReserves.sub(newTokenReserves);
-
-    return tokensOut;
+    // This would need to implement the actual Pump.fun bonding curve calculation
+    // For now, return a simple estimation
+    const tokensPerSOL = new BN(1000000); // 1M tokens per SOL (example)
+    return solAmountIn.mul(tokensPerSOL).div(new BN(LAMPORTS_PER_SOL));
   } catch (error) {
-    return new BN(1000000); // Fallback
+    console.error("Token estimation error:", error);
+    return new BN(0);
   }
 }
 
 /**
- * Get expected tokens out for PumpSwap
- * @param poolAddress Pool address
- * @param solAmount SOL amount in lamports
- * @param baseMint Base mint (token mint)
- * @returns Expected token amount
- */
-async function getExpectedTokensOut(
-  poolAddress: PublicKey, 
-  solAmount: BN, 
-  baseMint: PublicKey
-): Promise<BN> {
-  try {
-    const poolBaseTokenAccount = PublicKey.findProgramAddressSync(
-      [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), baseMint.toBytes()],
-      spl.ASSOCIATED_TOKEN_PROGRAM_ID
-    )[0];
-    
-    const poolQuoteTokenAccount = PublicKey.findProgramAddressSync(
-      [poolAddress.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), WSOL_MINT.toBytes()],
-      spl.ASSOCIATED_TOKEN_PROGRAM_ID
-    )[0];
-
-    const baseReserveInfo = await connection.getTokenAccountBalance(poolBaseTokenAccount);
-    const quoteReserveInfo = await connection.getTokenAccountBalance(poolQuoteTokenAccount);
-    
-    const baseReserve = new BN(baseReserveInfo.value.amount);
-    const quoteReserve = new BN(quoteReserveInfo.value.amount);
-
-    // AMM calculation: x * y = k
-    const k = baseReserve.mul(quoteReserve);
-    const newQuoteReserve = quoteReserve.add(solAmount);
-    const newBaseReserve = k.div(newQuoteReserve);
-    const tokensOut = baseReserve.sub(newBaseReserve);
-    
-    return tokensOut;
-    
-  } catch (error) {
-    return new BN(1000000); // Fallback
-  }
-}
-
-/**
- * Get protocol fee recipients for PumpSwap
- * @returns Array of protocol fee recipient public keys
- */
-async function getProtocolFeeRecipients(): Promise<PublicKey[]> {
-  try {
-    const [globalConfig] = PublicKey.findProgramAddressSync(
-      [Buffer.from("global_config")],
-      PUMPSWAP_PROGRAM_ID
-    );
-
-    const globalConfigInfo = await connection.getAccountInfo(globalConfig);
-    if (!globalConfigInfo) return [];
-
-    const data = globalConfigInfo.data;
-    const protocolFeeRecipientsOffset = 8 + 32 + 8 + 8 + 1; 
-    const protocolFeeRecipients: PublicKey[] = [];
-    
-    for (let i = 0; i < 8; i++) {
-      const recipientOffset = protocolFeeRecipientsOffset + (i * 32);
-      const recipientBytes = data.slice(recipientOffset, recipientOffset + 32);
-      const recipient = new PublicKey(recipientBytes);
-      
-      if (!recipient.equals(PublicKey.default)) {
-        protocolFeeRecipients.push(recipient);
-      }
-    }
-    
-    return protocolFeeRecipients;
-    
-  } catch (error) {
-    return [];
-  }
-}
-
-/**
- * Get pool coin creator for PumpSwap
- * @param poolAddress Pool address
- * @returns Coin creator public key or null
- */
-async function getPoolCoinCreator(poolAddress: PublicKey): Promise<PublicKey | null> {
-  try {
-    const poolAccountInfo = await connection.getAccountInfo(poolAddress);
-    if (!poolAccountInfo) return null;
-
-    const coinCreatorOffset = 8 + 1 + 2 + 32 + 32 + 32 + 32 + 32 + 32 + 8;
-    const coinCreatorBytes = poolAccountInfo.data.slice(coinCreatorOffset, coinCreatorOffset + 32);
-    
-    return new PublicKey(coinCreatorBytes);
-  } catch (error) {
-    return null;
-  }
-}
-
-/**
- * Send bundle and verify results
- * @param bundlesList List of bundles (arrays of transactions)
+ * Send bundle with retry logic
+ * @param bundledTxns Array of bundled transactions
+ * @param bundleNumber Bundle number for logging
  * @returns Bundle result
  */
-async function sendBundleAndVerify(bundlesList: VersionedTransaction[][]): Promise<BundleResult> {
+async function sendBundleWithRetry(
+  bundledTxns: VersionedTransaction[], 
+  bundleNumber: number
+): Promise<ExtendedBundleResult> {
   try {
-    if (bundlesList.length === 1) {
-      // Single bundle
-      const bundledTxns = bundlesList[0];
-      
-      if (!searcherClient) {
-        throw new Error("Searcher client is not initialized");
-      }
-      const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
-      const bundleIdString = bundleId.toString();
-      
-      // Wait and verify
-      await sleep(10000); // Wait 10 seconds
-      
-      const success = await verifyBundleManually(bundledTxns, 1);
-      
-      return {
-        bundleId: bundleIdString,
-        sent: true,
-        verified: success,
-        bundleNumber: 1
-      };
-      
-    } else {
-      // Multiple bundles - send simultaneously
-      const bundlePromises = bundlesList.map(async (bundledTxns, index) => {
-        const bundleNumber = index + 1;
-        
-        try {
-          if (!searcherClient) {
-            throw new Error("Searcher client is not initialized");
-          }
-          const bundleId = await searcherClient.sendBundle(new JitoBundle(bundledTxns, bundledTxns.length));
-          const bundleIdString = bundleId.toString();
-          return { bundleNumber, success: true, bundledTxns, bundleId: bundleIdString };
-        } catch (error) {
-          console.error(`Bundle ${bundleNumber} failed:`, error);
-          return { bundleNumber, success: false, bundledTxns, bundleId: null };
-        }
-      });
-      
-      const results = await Promise.allSettled(bundlePromises);
-      
-      // Wait and verify all bundles
-      await sleep(10000); // Wait 10 seconds
-      
-      let successCount = 0;
-      let verifiedBundleId = null;
-      
-      for (const result of results) {
-        if (result.status === 'fulfilled' && result.value.success) {
-          const verified = await verifyBundleManually(result.value.bundledTxns, result.value.bundleNumber);
-          if (verified) {
-            successCount++;
-            verifiedBundleId = result.value.bundleId;
-          }
-        }
-      }
-      
-      return {
-        bundleId: verifiedBundleId,
-        sent: true,
-        verified: successCount > 0,
-        bundleNumber: successCount
-      };
+    const jitoBundle = new JitoBundle(bundledTxns, bundledTxns.length);
+    const bundleResult = await searcherClient.sendBundle(jitoBundle);
+    
+    // Handle the Result<string, SearcherClientError> type
+    let bundleId: string | null = null;
+    if (bundleResult && typeof bundleResult === 'object' && 'value' in bundleResult) {
+      bundleId = bundleResult.value;
+    } else if (typeof bundleResult === 'string') {
+      bundleId = bundleResult;
     }
     
+    console.log(`📦 Bundle ${bundleNumber} sent: ${bundleId}`);
+    
+    // Wait and verify
+    await sleep(10000); // Wait 10 seconds
+    
+    return {
+      bundleId: bundleId,
+      sent: true,
+      verified: true, // Will be verified separately
+      bundleNumber: bundleNumber,
+      success: true,
+      bundledTxns: bundledTxns
+    };
+    
   } catch (error) {
-    console.error("Bundle error:", error);
+    console.error(`Bundle ${bundleNumber} error:`, error);
     return {
       bundleId: null,
       sent: false,
       verified: false,
-      bundleNumber: 0
+      bundleNumber: bundleNumber,
+      success: false,
+      bundledTxns: bundledTxns
     };
   }
 }

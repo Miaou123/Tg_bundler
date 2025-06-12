@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { UserSession } from '../../shared/types';
-import { setWaitingFor, addSessionData } from '../utils/sessions';
+import { setWaitingFor, addSessionData, getSessionData } from '../utils/sessions';
 import { createWalletSelectionKeyboard, createPercentageKeyboard, createSlippageKeyboard } from '../utils/keyboards';
 import { consoleRequiredMessage, formatMessage, processingMessage, successMessage, errorMessage } from '../utils/messages';
 import { showMainMenu } from './index';
@@ -8,9 +8,11 @@ import { WAITING_FOR } from '../../shared/constants';
 import { withTelegramPrompt } from '../utils/prompt';
 
 // Import core functions
-import { unifiedBuy } from '../../core/buy';
-import { unifiedSell } from '../../core/sell';
-import { sellAllTokensAndCleanup } from '../../core/cleanup';
+// Import core functions
+// Note: We'll need to modify these to accept userId parameter
+// import { unifiedBuy } from '../../core/buy';
+// import { unifiedSell } from '../../core/sell';
+// import { sellAllTokensAndCleanup } from '../../core/cleanup';
 
 /**
  * Handle create pool command
@@ -185,6 +187,10 @@ export async function handleTradingInput(
       
     case WAITING_FOR.BUY_SLIPPAGE:
       await handleBuySlippage(bot, chatId, userId, text);
+      break;
+
+    case WAITING_FOR.JITO_TIP:
+      await handleJitoTip(bot, chatId, userId, text, session);
       break;
       
     case 'cleanup_confirm':
@@ -461,6 +467,154 @@ async function handleBuySlippage(
 }
 
 /**
+ * Handle Jito tip input
+ * @param bot Telegram bot instance
+ * @param chatId Chat ID
+ * @param userId User ID
+ * @param text User input
+ * @param session User session
+ */
+async function handleJitoTip(
+  bot: TelegramBot,
+  chatId: number,
+  userId: number,
+  text: string,
+  session: UserSession
+): Promise<void> {
+  try {
+    const jitoTip = parseFloat(text);
+    if (isNaN(jitoTip) || jitoTip < 0) {
+      await bot.sendMessage(chatId, '❌ Invalid tip amount. Please enter a valid number (Ex. 0.01):');
+      return;
+    }
+    
+    addSessionData(userId, 'jitoTipLamports', Math.floor(jitoTip * 1e9)); // Convert to lamports
+    
+    // Execute the appropriate function based on currentFunction
+    const currentFunction = session.currentFunction;
+    
+    if (currentFunction === 'sellToken') {
+      await executeSellOperation(bot, chatId, userId, session);
+    } else if (currentFunction === 'buyToken') {
+      await executeBuyOperation(bot, chatId, userId, session);
+    } else {
+      await bot.sendMessage(chatId, '❌ Unknown operation. Returning to main menu.');
+      await showMainMenu(bot, chatId);
+    }
+    
+  } catch (error) {
+    await bot.sendMessage(chatId, errorMessage('Jito tip', error));
+    await showMainMenu(bot, chatId);
+  }
+}
+
+/**
+ * Execute sell operation with collected parameters
+ * @param bot Telegram bot instance
+ * @param chatId Chat ID
+ * @param userId User ID
+ * @param session User session
+ */
+async function executeSellOperation(
+  bot: TelegramBot,
+  chatId: number,
+  userId: number,
+  session: UserSession
+): Promise<void> {
+  try {
+    await bot.sendMessage(chatId, processingMessage('Executing sell operation'));
+    
+    // Get mint address from poolInfo
+    const { loadPoolInfo } = await import('../../shared/utils');
+    const poolInfo = loadPoolInfo();
+    
+    if (!poolInfo.mint) {
+      await bot.sendMessage(chatId, errorMessage('sell execution', 'No mint address found. Please create a token first.'));
+      await showMainMenu(bot, chatId);
+      return;
+    }
+    
+    const mintAddress = poolInfo.mint;
+    const selectionMode = getSessionData(userId, 'selectionMode');
+    const supplyPercent = getSessionData(userId, 'supplyPercent');
+    const slippagePercent = getSessionData(userId, 'slippagePercent');
+    const jitoTipLamports = getSessionData(userId, 'jitoTipLamports');
+    
+    // For now, show what would be executed
+    await bot.sendMessage(chatId, 
+      `🔄 **SELL OPERATION CONFIGURED**\n\n` +
+      `🎯 Token: ${mintAddress}\n` +
+      `🏪 Mode: ${selectionMode === 1 ? 'All Wallets' : selectionMode === 2 ? 'Bundle Only' : 'Creator Only'}\n` +
+      `📊 Amount: ${supplyPercent}% of tokens\n` +
+      `⚡ Slippage: ${slippagePercent}%\n` +
+      `💰 Jito Tip: ${(jitoTipLamports / 1e9).toFixed(4)} SOL\n\n` +
+      `⚠️ **Note:** Core sell function needs to be updated for multi-user support.\n` +
+      `Please use the console version for now.`,
+      { parse_mode: 'MarkdownV2' }
+    );
+    
+    await showMainMenu(bot, chatId);
+    
+  } catch (error) {
+    await bot.sendMessage(chatId, errorMessage('sell execution', error));
+    await showMainMenu(bot, chatId);
+  }
+}
+
+/**
+ * Execute buy operation with collected parameters
+ * @param bot Telegram bot instance
+ * @param chatId Chat ID
+ * @param userId User ID
+ * @param session User session
+ */
+async function executeBuyOperation(
+  bot: TelegramBot,
+  chatId: number,
+  userId: number,
+  session: UserSession
+): Promise<void> {
+  try {
+    await bot.sendMessage(chatId, processingMessage('Executing buy operation'));
+    
+    // Get mint address from poolInfo
+    const { loadPoolInfo } = await import('../../shared/utils');
+    const poolInfo = loadPoolInfo();
+    
+    if (!poolInfo.mint) {
+      await bot.sendMessage(chatId, errorMessage('buy execution', 'No mint address found. Please create a token first.'));
+      await showMainMenu(bot, chatId);
+      return;
+    }
+    
+    const mintAddress = poolInfo.mint;
+    const selectionMode = getSessionData(userId, 'selectionMode');
+    const totalSOL = getSessionData(userId, 'totalSOL');
+    const slippagePercent = getSessionData(userId, 'slippagePercent');
+    const jitoTipLamports = getSessionData(userId, 'jitoTipLamports');
+    
+    // For now, show what would be executed
+    await bot.sendMessage(chatId, 
+      `🔄 **BUY OPERATION CONFIGURED**\n\n` +
+      `🎯 Token: ${mintAddress}\n` +
+      `🏪 Mode: ${selectionMode === 1 ? 'All Wallets' : selectionMode === 2 ? 'Bundle Only' : 'Creator Only'}\n` +
+      `💰 Total SOL: ${totalSOL} SOL\n` +
+      `⚡ Slippage: ${slippagePercent}%\n` +
+      `💰 Jito Tip: ${(jitoTipLamports / 1e9).toFixed(4)} SOL\n\n` +
+      `⚠️ **Note:** Core buy function needs to be updated for multi-user support.\n` +
+      `Please use the console version for now.`,
+      { parse_mode: 'MarkdownV2' }
+    );
+    
+    await showMainMenu(bot, chatId);
+    
+  } catch (error) {
+    await bot.sendMessage(chatId, errorMessage('buy execution', error));
+    await showMainMenu(bot, chatId);
+  }
+}
+
+/**
  * Handle cleanup confirm
  * @param bot Telegram bot instance
  * @param chatId Chat ID
@@ -480,19 +634,14 @@ async function handleCleanupConfirm(
       return;
     }
     
-    await bot.sendMessage(chatId, processingMessage('Cleaning up wallets'));
-    
-    // Execute the operation
-    await withTelegramPrompt(
-      bot,
-      chatId,
-      ['y'], // Always confirm with 'y'
-      async () => {
-        await sellAllTokensAndCleanup();
-      }
+    await bot.sendMessage(chatId, 
+      `⚠️ **CLEANUP OPERATION**\n\n` +
+      `This would sell all tokens from all wallets and return SOL to the payer wallet.\n\n` +
+      `**Note:** Core cleanup function needs to be updated for multi-user support.\n` +
+      `Please use the console version for now.`,
+      { parse_mode: 'MarkdownV2' }
     );
     
-    await bot.sendMessage(chatId, successMessage('Wallet cleanup'));
     await showMainMenu(bot, chatId);
     
   } catch (error) {

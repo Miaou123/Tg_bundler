@@ -53,7 +53,7 @@ export async function handleCreateLUTCheck(bot: TelegramBot, chatId: number, use
           inline_keyboard: [
             [
               { text: '✅ Create New LUT', callback_data: 'confirm_create_lut' },
-              { text: '❌ Cancel', callback_data: 'main_menu' }
+              { text: '❌ Cancel', callback_data: 'pre_launch' }
             ]
           ]
         },
@@ -131,7 +131,7 @@ export async function handleCreateLUTWithTip(bot: TelegramBot, chatId: number, u
       return;
     }
     
-    await bot.sendMessage(chatId, '⏳ Creating Lookup Table\\.\\.\\.');
+    await bot.sendMessage(chatId, '⏳ Creating Lookup Table...');
     
     // Call the core LUT creation function
     const { createUserLUT } = await import('../../core/lut');
@@ -140,16 +140,16 @@ export async function handleCreateLUTWithTip(bot: TelegramBot, chatId: number, u
     const tipString = tipAmount.toString().replace(/\./g, '\\.');
     await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n🔗 Lookup Table created successfully\n💰 Jito tip: ${tipString} SOL`, { parse_mode: 'MarkdownV2' });
     
-    // Return to main menu
-    await returnToMainMenu(bot, chatId);
+    // Return to pre-launch menu instead of main menu
+    await returnToPreLaunchMenu(bot, chatId);
     
   } catch (error: any) {
     console.error('Error in LUT creation:', error);
     const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
     await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
     
-    // Return to main menu on error
-    await returnToMainMenu(bot, chatId);
+    // Return to pre-launch menu on error
+    await returnToPreLaunchMenu(bot, chatId);
   }
 }
 
@@ -164,7 +164,7 @@ export async function handleExtendLUTWithTip(bot: TelegramBot, chatId: number, u
       return;
     }
     
-    await bot.sendMessage(chatId, '⏳ Extending Lookup Table\\.\\.\\.');
+    await bot.sendMessage(chatId, '⏳ Extending Lookup Table...');
     
     // Call the core LUT extend function
     const { extendUserLUT } = await import('../../core/lut');
@@ -173,16 +173,16 @@ export async function handleExtendLUTWithTip(bot: TelegramBot, chatId: number, u
     const tipString = tipAmount.toString().replace(/\./g, '\\.');
     await bot.sendMessage(chatId, `✅ **SUCCESS\\!**\n\n📦 Lookup Table extended successfully\n💰 Jito tip: ${tipString} SOL`, { parse_mode: 'MarkdownV2' });
     
-    // Return to main menu
-    await returnToMainMenu(bot, chatId);
+    // Return to pre-launch menu instead of main menu
+    await returnToPreLaunchMenu(bot, chatId);
     
   } catch (error: any) {
     console.error('Error in LUT extension:', error);
     const errorText = `❌ **ERROR:**\n\n${error.message || error}`.replace(/[.!]/g, '\\$&');
     await bot.sendMessage(chatId, errorText, { parse_mode: 'MarkdownV2' });
     
-    // Return to main menu on error
-    await returnToMainMenu(bot, chatId);
+    // Return to pre-launch menu on error
+    await returnToPreLaunchMenu(bot, chatId);
   }
 }
 
@@ -191,6 +191,9 @@ export async function handleExtendLUTWithTip(bot: TelegramBot, chatId: number, u
  */
 export async function handleSimulateBuys(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId, '🎲 Simulate Buys feature is coming soon...', { parse_mode: 'MarkdownV2' });
+  
+  // Return to pre-launch menu
+  await returnToPreLaunchMenu(bot, chatId);
 }
 
 /**
@@ -198,6 +201,9 @@ export async function handleSimulateBuys(bot: TelegramBot, chatId: number, userI
  */
 export async function handleSendSOL(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId, '💸 Send SOL feature is coming soon...', { parse_mode: 'MarkdownV2' });
+  
+  // Return to pre-launch menu
+  await returnToPreLaunchMenu(bot, chatId);
 }
 
 /**
@@ -205,10 +211,27 @@ export async function handleSendSOL(bot: TelegramBot, chatId: number, userId: nu
  */
 export async function handleReclaimSOL(bot: TelegramBot, chatId: number, userId: number): Promise<void> {
   await bot.sendMessage(chatId, '💰 Reclaim SOL feature is coming soon...', { parse_mode: 'MarkdownV2' });
+  
+  // Return to pre-launch menu
+  await returnToPreLaunchMenu(bot, chatId);
 }
 
 /**
- * Helper function to return to main menu
+ * Helper function to return to pre-launch menu
+ */
+async function returnToPreLaunchMenu(bot: TelegramBot, chatId: number): Promise<void> {
+  const { createPreLaunchKeyboard } = await import('../utils/keyboards');
+  const { PRE_LAUNCH_MESSAGE, formatMessage } = await import('../utils/messages');
+  
+  await bot.sendMessage(
+    chatId,
+    formatMessage(PRE_LAUNCH_MESSAGE),
+    { ...createPreLaunchKeyboard(), parse_mode: PRE_LAUNCH_MESSAGE.parse_mode }
+  );
+}
+
+/**
+ * Helper function to return to main menu (keep for other operations that need it)
  */
 async function returnToMainMenu(bot: TelegramBot, chatId: number): Promise<void> {
   const { createMainMenuKeyboard } = await import('../utils/keyboards');

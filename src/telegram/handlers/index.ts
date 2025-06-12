@@ -5,8 +5,8 @@ import { MAIN_MENU_MESSAGE, PRE_LAUNCH_MESSAGE, formatMessage } from '../utils/m
 import { ERRORS } from '../../shared/constants';
 import { MENUS } from '../../shared/constants';
 
-// Import specific handlers
-import * as walletHandlers from './wallet';
+// Import specific handlers - remove the wallet import since it doesn't exist
+// import * as walletHandlers from './wallet';  // Remove this line
 import * as tradingHandlers from './trading';
 import * as infoHandlers from './info';
 import * as vanityHandlers from './vanity';
@@ -81,16 +81,13 @@ async function handleWaitingInput(
   // Route to appropriate handler based on what we're waiting for
   if (waitingFor?.startsWith('vanity_')) {
     await vanityHandlers.handleVanityInput(bot, chatId, userId, text, session);
-  } else if (waitingFor?.startsWith('wallet_')) {
-    await walletHandlers.handleWalletInput(bot, chatId, userId, text, session);
-  } else if (waitingFor?.startsWith('trading_')) {
+  } else if (waitingFor?.startsWith('trading_') || waitingFor?.includes('_selection_mode')) {
+    // Handle trading inputs (buy/sell selection modes)
     await tradingHandlers.handleTradingInput(bot, chatId, userId, text, session);
-  } else if (waitingFor?.startsWith('info_')) {
-    await infoHandlers.handleInfoInput(bot, chatId, userId, text, session);
   } else {
     // Unknown waiting state
     session.waitingFor = undefined;
-    await bot.sendMessage(chatId, '❓ Unexpected input. Returning to main menu.');
+    await bot.sendMessage(chatId, '❓ Unexpected input. Returning to main menu...');
     await showMainMenu(bot, chatId);
   }
 }
@@ -100,129 +97,88 @@ async function handleWaitingInput(
  * @param bot Telegram bot instance
  * @param chatId Chat ID
  * @param userId User ID
- * @param text Selected menu option
+ * @param text Menu selection text
  */
 async function handleMenuSelection(
-  bot: TelegramBot, 
+  bot: TelegramBot,
   chatId: number, 
   userId: number, 
   text: string
 ): Promise<void> {
   const session = getUserSession(userId);
-  const currentMenu = session.currentFunction || MENUS.MAIN;
   
-  // Main menu options
-  if (currentMenu === MENUS.MAIN) {
-    switch (text) {
-      case '🔑 Create Keypairs':
-        await walletHandlers.handleCreateKeypairs(bot, chatId, userId, session);
-        break;
-        
-      case '📋 Pre Launch':
-        session.currentFunction = MENUS.PRE_LAUNCH;
-        await showPreLaunchMenu(bot, chatId);
-        break;
-        
-      case '🚀 Create Pool':
-        await tradingHandlers.handleCreatePool(bot, chatId, userId, session);
-        break;
-        
-      case '💰 Sell Tokens':
-        await tradingHandlers.handleSellTokens(bot, chatId, userId, session);
-        break;
-        
-      case '💸 Buy Tokens':
-        await tradingHandlers.handleBuyTokens(bot, chatId, userId, session);
-        break;
-        
-      case '🧹 Cleanup All':
-        await tradingHandlers.handleCleanupAll(bot, chatId, userId, session);
-        break;
-        
-      case '📊 Export Wallets':
-        await walletHandlers.handleExportWallets(bot, chatId, userId, session);
-        break;
-        
-      case '💰 Check Balances':
-        await infoHandlers.handleCheckBalances(bot, chatId, userId, session);
-        break;
-        
-      case '🎯 Vanity Address':
-        await vanityHandlers.handleVanityAddress(bot, chatId, userId, session);
-        break;
-        
-      case '📊 Vanity Calc':
-        await vanityHandlers.handleVanityDifficulty(bot, chatId, userId, session);
-        break;
-        
-      case '❌ Exit':
-        await bot.sendMessage(chatId, '👋 Session ended. Use /start to begin again.');
-        clearUserSession(userId);
-        break;
-        
-      default:
-        await bot.sendMessage(chatId, '❓ Please select an option from the menu.');
-        break;
-    }
+  switch (text) {
+    // Main menu options
+    case '🔑 Create Keypairs':
+      // Handle keypair creation - you'll need to implement this
+      await bot.sendMessage(chatId, '🔑 Keypair creation functionality coming soon...');
+      break;
+      
+    case '🚀 Create Pool':
+      await tradingHandlers.handleCreatePool(bot, chatId, userId, session);
+      break;
+      
+    case '💰 Sell Tokens':
+      await tradingHandlers.handleSellTokens(bot, chatId, userId, session);
+      break;
+      
+    case '💸 Buy Tokens':
+      await tradingHandlers.handleBuyTokens(bot, chatId, userId, session);
+      break;
+      
+    case '🧹 Cleanup All':
+      await tradingHandlers.handleCleanupAll(bot, chatId, userId, session);
+      break;
+      
+    case '📊 Export Wallets':
+      await infoHandlers.handleExportWallets(bot, chatId, userId);
+      break;
+      
+    case '💰 Check Balances':
+      await infoHandlers.handleCheckBalances(bot, chatId, userId);
+      break;
+      
+    case '🎯 Vanity Address':
+      await vanityHandlers.handleVanityAddress(bot, chatId, userId, session);
+      break;
+      
+    case '📊 Vanity Calc':
+      await vanityHandlers.handleVanityDifficulty(bot, chatId, userId, session);
+      break;
+      
+    case '🔙 Main Menu':
+      await showMainMenu(bot, chatId);
+      break;
+      
+    default:
+      await bot.sendMessage(chatId, '❓ Unknown option. Please use the keyboard buttons.');
+      await showMainMenu(bot, chatId);
+      break;
   }
-  // Pre-launch menu options
-  else if (currentMenu === MENUS.PRE_LAUNCH) {
-    switch (text) {
-      case '🔗 Create LUT':
-        await walletHandlers.handleCreateLUT(bot, chatId, userId, session);
-        break;
-        
-      case '📦 Extend LUT':
-        await walletHandlers.handleExtendLUT(bot, chatId, userId, session);
-        break;
-        
-      case '🎲 Simulate Buys':
-        await tradingHandlers.handleSimulateBuys(bot, chatId, userId, session);
-        break;
-        
-      case '💸 Send SOL':
-        await walletHandlers.handleSendSOL(bot, chatId, userId, session);
-        break;
-        
-      case '💰 Reclaim SOL':
-        await walletHandlers.handleReclaimSOL(bot, chatId, userId, session);
-        break;
-        
-      case '🔙 Main Menu':
-        session.currentFunction = MENUS.MAIN;
-        await showMainMenu(bot, chatId);
-        break;
-        
-      default:
-        await bot.sendMessage(chatId, '❓ Please select an option from the menu.');
-        break;
-    }
-  }
-  // Handle other specific menus similarly if needed
 }
 
 /**
- * Show the main menu
+ * Show main menu
  * @param bot Telegram bot instance
- * @param chatId Chat ID to send menu to
+ * @param chatId Chat ID
  */
 export async function showMainMenu(bot: TelegramBot, chatId: number): Promise<void> {
   await bot.sendMessage(
-    chatId, 
-    formatMessage(MAIN_MENU_MESSAGE), 
+    chatId,
+    formatMessage(MAIN_MENU_MESSAGE),
     { ...createMainMenuKeyboard(), parse_mode: MAIN_MENU_MESSAGE.parse_mode }
   );
 }
 
 /**
- * Show the pre-launch menu
+ * Show pre-launch menu
  * @param bot Telegram bot instance
- * @param chatId Chat ID to send menu to
+ * @param chatId Chat ID
  */
 export async function showPreLaunchMenu(bot: TelegramBot, chatId: number): Promise<void> {
   await bot.sendMessage(
-    chatId, 
-    formatMessage(PRE_LAUNCH_MESSAGE), 
+    chatId,
+    formatMessage(PRE_LAUNCH_MESSAGE),
     { ...createPreLaunchKeyboard(), parse_mode: PRE_LAUNCH_MESSAGE.parse_mode }
   );
 }

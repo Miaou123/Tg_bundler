@@ -1,5 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { BOT_TOKEN, AUTHORIZED_TELEGRAM_USERS } from '../shared/config';
+import { getUserSession } from './utils/sessions';
 
 // Import handlers
 import * as keypairHandlers from './handlers/keypair';
@@ -128,19 +129,31 @@ async function handleCallbackQuery(bot: TelegramBot, chatId: number, userId: num
       
     // Trading handlers
     case 'create_pool':
-      await tradingHandlers.handleCreatePool(bot, chatId, userId);
+      {
+        const session = getUserSession(userId);
+        await tradingHandlers.handleCreatePool(bot, chatId, userId, session);
+      }
       break;
       
     case 'sell_tokens':
-      await tradingHandlers.handleSellTokens(bot, chatId, userId);
+      {
+        const session = getUserSession(userId);
+        await tradingHandlers.handleSellTokens(bot, chatId, userId, session);
+      }
       break;
       
     case 'buy_tokens':
-      await tradingHandlers.handleBuyTokens(bot, chatId, userId);
+      {
+        const session = getUserSession(userId);
+        await tradingHandlers.handleBuyTokens(bot, chatId, userId, session);
+      }
       break;
       
     case 'cleanup_all':
-      await tradingHandlers.handleCleanupAll(bot, chatId, userId);
+      {
+        const session = getUserSession(userId);
+        await tradingHandlers.handleCleanupAll(bot, chatId, userId, session);
+      }
       break;
       
     // Info handlers
