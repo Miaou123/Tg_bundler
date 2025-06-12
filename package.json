@@ -1,10 +1,14 @@
 {
-	"name": "PumpFun-Bundler",
+	"name": "Bundler-tg",
 	"version": "1.0.0",
 	"description": "https://solana-scripts.com",
 	"main": "index.js",
 	"scripts": {
-		"start": "ts-node main.ts"
+		"start": "ts-node console-main.ts",
+		"console": "ts-node console-main.ts", 
+		"telegram": "ts-node telegram-main.ts",
+		"launcher": "ts-node launcher.ts",
+		"dev": "ts-node --watch telegram-main.ts"
 	},
 	"author": "https://solana-scripts.com",
 	"license": "ISC",
@@ -28,6 +32,7 @@
 		"mime": "^4.0.1",
 		"nft.storage": "^7.1.1",
 		"node-fetch": "^3.3.2",
+		"node-telegram-bot-api": "^0.66.0",
 		"path": "^0.12.7",
 		"prompt-sync": "^4.2.0",
 		"protobufjs": "^7.2.6",
@@ -39,6 +44,7 @@
 		"@types/bn.js": "^5.1.5",
 		"@types/convict": "^6.1.6",
 		"@types/node-fetch": "^2.6.9",
+		"@types/node-telegram-bot-api": "^0.64.9",
 		"@types/prompt-sync": "^4.2.3",
 		"javascript-obfuscator": "^4.1.0"
 	}
